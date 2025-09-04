@@ -1,7 +1,31 @@
+# PlatformIO
 .pio
+.pioenvs
+.piolibdeps
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Configuration files
 include/config.h
-include/config.h
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*~
+
+# IDE files
+*.swp
+*.swo

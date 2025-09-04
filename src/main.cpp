@@ -1,101 +1,82 @@
-// Phase 1: ESP32 Coffee Roaster with MQTT Added
-// Keeps all existing functionality and adds MQTT communication
+// ESP32 Coffee Roaster - Streamlined MQTT-Only Version
+// Core control functions with WiFi, OTA, and MQTT communication
 
 #include <SPI.h>
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ModbusTCP.h>
 #include <ArduinoOTA.h>
 #include <PID_v1.h>
 #include "MAX6675Handler.h"
 #include <EEPROM.h>
-#include <WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "driver/gpio.h"
 #include "config.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 
-// Debugging Macro
+// Debugging Macros
 #define DEBUG true
 #if DEBUG
   #define DEBUG_PRINT(x) Serial.print(x)
   #define DEBUG_PRINTLN(x) Serial.println(x)
-  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, __VA_ARGS__)
+  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+  #define DEBUG_PRINTF_P(fmt, ...) Serial.printf_P(fmt, ##__VA_ARGS__)
 #else
   #define DEBUG_PRINT(x)
   #define DEBUG_PRINTLN(x)
   #define DEBUG_PRINTF(fmt, ...)
+  #define DEBUG_PRINTF_P(fmt, ...)
 #endif
 
-// MQTT Configuration
-#define MQTT_BROKER "192.168.1.100"  // Update with your broker IP
-#define MQTT_PORT 1883
-#define DEVICE_ID "esp32_roaster_01"
-#define MQTT_CLIENT_ID "esp32_coffee_roaster"
+// Hardware Pin Definitions (now in config.h)
+#define BT_CS   BT_CS_PIN
+#define ET_CS   ET_CS_PIN
 
-// MQTT Topics
-String telemetryTopic = "roaster/" + String(DEVICE_ID) + "/telemetry";
-String statusTopic = "roaster/" + String(DEVICE_ID) + "/status";
-String controlTopicBase = "roaster/" + String(DEVICE_ID) + "/control/";
-
-// Existing definitions
-WebServer server(80);
-#define BT_CS   4
-#define ET_CS   5
-#define SSR_PIN  33
-#define FAN_PIN  25
-
+// Control Modes
 #define MODE_MANUAL 0
 #define MODE_AUTO 1
-#define MODE_PID_AUTOTUNE 2
+
+// System Status
+typedef enum {
+    SYSTEM_OK = 0,
+    WIFI_ERROR = 1,
+    MQTT_ERROR = 2,
+    SENSOR_ERROR = 3,
+    SAFETY_ERROR = 4
+} SystemStatus;
+
+SystemStatus systemStatus = SYSTEM_OK;
+unsigned long lastStatusUpdate = 0;
+const unsigned long statusUpdateInterval = 5000;
 
 // MQTT Client
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
-// Existing variables
-ModbusTCP modbusTCP;
+// Control Variables
 double beanSetpoint = 0.0;
 double beanTemperature = 0.0;
 double heaterOutput = 0.0;
-double Kp = 15.0, Ki = 1.0, Kd = 25.0;
-float beanTempOffset = 0.0;
-float envTempOffset = 0.0;
+double Kp = DEFAULT_KP, Ki = DEFAULT_KI, Kd = DEFAULT_KD;
+float beanTempOffset = TEMP_CALIBRATION_BEAN;
+float envTempOffset = TEMP_CALIBRATION_ENV;
 PID beanPID(&beanTemperature, &heaterOutput, &beanSetpoint, Kp, Ki, Kd, DIRECT);
 float envTemperature = 0.0;
 int fanPWM = 0;
-
-// Modbus Registers (unchanged)
-#define REG_BEAN_TEMP 0
-#define REG_ENV_TEMP 1
-#define REG_HEATER_PWM 2
-#define REG_FAN_PWM 3
-#define REG_BEAN_SP 4
-#define REG_CONTROL_MODE 5
-#define REG_OVERRIDE_HEATER 6
-#define REG_KP 7
-#define REG_KI 8
-#define REG_KD 9
+int controlMode = MODE_MANUAL;
+bool heaterEnabled = false;
 
 // Timing variables
 unsigned long lastTempRead = 0;
-const unsigned long tempReadInterval = 1000;
-unsigned long lastModbusTask = 0;
-const unsigned long modbusTaskInterval = 10;
 unsigned long lastPidCompute = 0;
-const unsigned long pidComputeInterval = 100;
 unsigned long lastSerialOutput = 0;
-const unsigned long serialOutputInterval = 1000;
-
-// MQTT timing
 unsigned long lastMqttPublish = 0;
-const unsigned long mqttPublishInterval = 1000;
 unsigned long lastMqttReconnect = 0;
-const unsigned long mqttReconnectInterval = 5000;
 
 // Rate of Rise calculation
-float tempHistory[10];
-unsigned long timeHistory[10];
+float tempHistory[RATE_HISTORY_SIZE];
+unsigned long timeHistory[RATE_HISTORY_SIZE];
 int historyIndex = 0;
 int historyCount = 0;
 
@@ -104,7 +85,6 @@ MAX6675Handler envThermocouple(ET_CS);
 
 // Function prototypes
 void initializePins();
-void connectToWiFi(const char* ssid, const char* password);
 void setupMQTT();
 void connectMQTT();
 void handleMQTTMessage(char* topic, byte* payload, unsigned int length);
@@ -112,20 +92,29 @@ void publishMQTTTelemetry();
 void publishMQTTStatus(const String& status);
 void updateRateOfRise(float currentTemp);
 float getRateOfRise();
-void autoTunePID();
 void applyCalibration();
 void updatePIDParameters();
 void savePIDParameters();
 void loadPIDParameters();
-void handleWebServer();
-void handleDataRequest();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void checkWiFiConnection();
+void updateSystemStatus();
+SystemStatus checkSensors();
+SystemStatus checkConnectivity();
+void handleControlSetpoint(const String& payload);
+void handleControlFan(const String& payload);
+void handleControlHeater(const String& payload);
+void handleControlMode(const String& payload);
+void handleControlEnable(const String& payload);
+void handleControlPID(const String& payload);
+void handleEmergencyStop(const String& payload);
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    DEBUG_PRINTLN("Starting Coffee Roaster Control with MQTT...");
+    DEBUG_PRINTLN(F("Starting Coffee Roaster Control with MQTT..."));
 
-    EEPROM.begin(512);
+    EEPROM.begin(EEPROM_SIZE);
     initializePins();
 
     // Initialize LEDC for PWM
@@ -136,219 +125,231 @@ void setup() {
     gpio_set_drive_capability((gpio_num_t)FAN_PIN, GPIO_DRIVE_CAP_3);
 
     loadPIDParameters();
-    connectToWiFi(ssid, password);
     
-    // Setup MQTT
-    setupMQTT();
-
-    // Initialize Modbus server (existing)
-    modbusTCP.server();
-    for (int i = 0; i < 10; i++) {
-        modbusTCP.addHreg(i, 0);
+    // Initialize WiFi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println(F("\nWiFi connected!"));
+        Serial.printf_P(PSTR("IP Address: %s\n"), WiFi.localIP().toString().c_str());
+        
+        setupMQTT();
+        delay(100);
+        connectMQTT();
+    } else {
+        Serial.println(F("\nWiFi connection failed!"));
     }
 
     // Initialize thermocouples
     beanThermocouple.begin();
     envThermocouple.begin();
-    DEBUG_PRINTLN("MAX6675 Initialized");
+    DEBUG_PRINTLN(F("MAX6675 Initialized"));
 
     ArduinoOTA.begin();
-    DEBUG_PRINTLN("OTA Ready");
+    DEBUG_PRINTLN(F("OTA Ready"));
 
     // Initialize PID
     beanPID.SetMode(AUTOMATIC);
     beanPID.SetOutputLimits(0, 255);
-
-    // Start Web Server
-    server.on("/", handleWebServer);
-    server.on("/data", handleDataRequest);
-    server.begin();
-    DEBUG_PRINTLN("Web Server Started");
     
-    DEBUG_PRINTLN("Setup complete - All systems ready");
+    DEBUG_PRINTLN(F("Setup complete - All systems ready"));
+
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+    esp_task_wdt_add(NULL);
 }
 
 void loop() {
-    // Existing functionality
+    esp_task_wdt_reset();
+    
+    checkWiFiConnection();
+    updateSystemStatus();
     ArduinoOTA.handle();
-    modbusTCP.task();
-    server.handleClient();
     
     // MQTT handling
     if (!mqttClient.connected()) {
-        if (millis() - lastMqttReconnect > mqttReconnectInterval) {
+        static unsigned long lastReconnectAttempt = 0;
+        unsigned long now = millis();
+        if (now - lastReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
+            lastReconnectAttempt = now;
             connectMQTT();
-            lastMqttReconnect = millis();
         }
-    } else {
-        mqttClient.loop();
     }
-
-    updatePIDParameters();
-
-    int controlMode = modbusTCP.Hreg(REG_CONTROL_MODE);
-    int heaterOverride = modbusTCP.Hreg(REG_OVERRIDE_HEATER);
-    fanPWM = modbusTCP.Hreg(REG_FAN_PWM);
-
-    ledcWrite(1, fanPWM);
+    mqttClient.loop();
 
     // Read Temperatures
-    if (millis() - lastTempRead >= tempReadInterval) {
+    if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
         lastTempRead = millis();
         beanTemperature = beanThermocouple.readTemperature();
         envTemperature = envThermocouple.readTemperature();
-        applyCalibration();
         
-        // Update rate of rise
-        if (!isnan(beanTemperature)) {
+        if (!isnan(beanTemperature) && !isnan(envTemperature)) {
+            applyCalibration();
             updateRateOfRise(beanTemperature);
         }
     }
 
-    // Update Modbus Registers
-    if (millis() - lastModbusTask >= modbusTaskInterval) {
-        lastModbusTask = millis();
-        modbusTCP.Hreg(REG_BEAN_TEMP, static_cast<uint16_t>(beanTemperature * 10));
-        modbusTCP.Hreg(REG_ENV_TEMP, static_cast<uint16_t>(envTemperature * 10));
-        modbusTCP.Hreg(REG_HEATER_PWM, static_cast<uint16_t>(heaterOutput));
-    }
+    // Control fan
+    ledcWrite(1, fanPWM);
 
-    // Heater Control Logic (unchanged)
-    if (heaterOverride == 0) {
+    // Heater Control Logic
+    if (!heaterEnabled) {
         heaterOutput = 0;
         ledcWrite(0, 0);
     } else {
         if (controlMode == MODE_MANUAL) {
-            heaterOutput = modbusTCP.Hreg(REG_HEATER_PWM) / 100.0 * 255;
-            if (fanPWM > 100) {
+            // In manual mode, heaterOutput is set directly via MQTT
+            if (fanPWM > SAFETY_MIN_FAN_PWM) {
                 ledcWrite(0, static_cast<int>(heaterOutput));
             } else {
                 ledcWrite(0, 0);
-                DEBUG_PRINTLN("Failsafe: Fan too low, heater off.");
+                DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
             }
         } else if (controlMode == MODE_AUTO) {
-            beanSetpoint = modbusTCP.Hreg(REG_BEAN_SP) / 10.0;
             if (!isnan(beanTemperature)) {
-                if (millis() - lastPidCompute >= pidComputeInterval) {
+                if (millis() - lastPidCompute >= PID_COMPUTE_INTERVAL) {
                     lastPidCompute = millis();
                     beanPID.Compute();
                 }
-                if (fanPWM > 100) {
+                if (fanPWM > SAFETY_MIN_FAN_PWM) {
                     ledcWrite(0, static_cast<int>(heaterOutput));
                 } else {
                     ledcWrite(0, 0);
-                    DEBUG_PRINTLN("Failsafe: Fan too low, heater off.");
+                    DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
                 }
             } else {
-                DEBUG_PRINTLN("Invalid bean temperature! Heater disabled.");
+                DEBUG_PRINTLN(F("Invalid bean temperature! Heater disabled."));
                 ledcWrite(0, 0);
             }
         }
     }
 
     // MQTT Telemetry Publishing
-    if (mqttClient.connected() && millis() - lastMqttPublish >= mqttPublishInterval) {
+    if (mqttClient.connected() && millis() - lastMqttPublish >= MQTT_PUBLISH_INTERVAL) {
         lastMqttPublish = millis();
         publishMQTTTelemetry();
     }
 
-    // Serial Output (unchanged)
-    if (millis() - lastSerialOutput >= serialOutputInterval) {
+    // Serial Output
+    if (millis() - lastSerialOutput >= SERIAL_OUTPUT_INTERVAL) {
         lastSerialOutput = millis();
-        DEBUG_PRINTLN("System Status:");
+        DEBUG_PRINTLN(F("System Status:"));
         DEBUG_PRINTF("Mode: %s, BT: %.2f°C, ET: %.2f°C, ROR: %.2f°C/min\n",
                      (controlMode == MODE_MANUAL) ? "Manual" : "Auto",
                      beanTemperature, envTemperature, getRateOfRise());
-        DEBUG_PRINTF("Heater: %d, Fan: %d, Override: %d, MQTT: %s\n",
-                     static_cast<int>(heaterOutput), fanPWM, heaterOverride,
+        DEBUG_PRINTF("Heater: %d, Fan: %d, Enabled: %d, MQTT: %s\n",
+                     static_cast<int>(heaterOutput), fanPWM, heaterEnabled,
                      mqttClient.connected() ? "OK" : "DISCONNECTED");
     }
 }
 
 void setupMQTT() {
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setCallback(handleMQTTMessage);
-    mqttClient.setBufferSize(1024);
-    DEBUG_PRINTF("MQTT setup complete - Broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setKeepAlive(15);
+    mqttClient.setSocketTimeout(10);
+    mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+
+    DEBUG_PRINTF_P(PSTR("MQTT broker configured: %s:%d\n"), MQTT_BROKER, MQTT_PORT);
 }
 
 void connectMQTT() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        DEBUG_PRINTLN(F("WiFi not connected - can't connect to MQTT"));
+        return;
+    }
     
-    DEBUG_PRINT("Attempting MQTT connection...");
-    if (mqttClient.connect(MQTT_CLIENT_ID)) {
-        DEBUG_PRINTLN(" connected!");
-        
-        // Subscribe to control topics
-        String controlPattern = controlTopicBase + "+";
-        mqttClient.subscribe(controlPattern.c_str());
-        
-        // Publish connection status
-        publishMQTTStatus("connected");
-        
-        DEBUG_PRINTLN("MQTT subscribed to control topics");
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char clientId[50];
+    snprintf(clientId, sizeof(clientId), "%s-%02X%02X%02X", MQTT_CLIENT_ID, mac[3], mac[4], mac[5]);
+    
+    DEBUG_PRINTF_P(PSTR("Attempting MQTT connection as %s..."), clientId);
+    
+    if (mqttClient.connect(
+            clientId,
+            MQTT_STATUS_TOPIC,
+            1,
+            true,
+            "{\"status\":\"offline\"}"
+        )) {
+        DEBUG_PRINTLN(F(" connected!"));
+    
+        // Subscribe to all control topics
+        String controlPattern = String(MQTT_CONTROL_TOPIC) + "/#";
+        if (mqttClient.subscribe(controlPattern.c_str())) {
+            DEBUG_PRINTLN(F("Subscribed to control topics"));
+
+            // Publish "online" status
+            StaticJsonDocument<200> doc;
+            doc["status"] = "online";
+            doc["id"] = clientId;
+            doc["ip"] = WiFi.localIP().toString();
+            doc["rssi"] = WiFi.RSSI();
+            String statusMsg;
+            serializeJson(doc, statusMsg);
+            mqttClient.publish(MQTT_STATUS_TOPIC, statusMsg.c_str(), true);
+        }   
     } else {
-        DEBUG_PRINTF(" failed, rc=%d\n", mqttClient.state());
+        int state = mqttClient.state();
+        DEBUG_PRINTF(" failed, rc=%d\n", state);
+        
+        DEBUG_PRINTF("Network diagnostics:\n");
+        DEBUG_PRINTF("- WiFi RSSI: %d dBm\n", WiFi.RSSI());
+        DEBUG_PRINTF("- Local IP: %s\n", WiFi.localIP().toString().c_str());
+        
+        IPAddress brokerIP;
+        if (WiFi.hostByName(MQTT_BROKER, brokerIP)) {
+            DEBUG_PRINTF("- Broker IP resolved: %s\n", brokerIP.toString().c_str());
+        } else {
+            DEBUG_PRINTLN(F("- DNS resolution failed!"));
+        }
     }
 }
 
 void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
     String topicStr = String(topic);
-    String payloadStr = "";
-    
+    String payloadStr;
+    payloadStr.reserve(length);
     for (unsigned int i = 0; i < length; i++) {
         payloadStr += (char)payload[i];
     }
+
+    DEBUG_PRINTF_P(PSTR("MQTT RX: %s = %s\n"), topic, payloadStr.c_str());
     
-    DEBUG_PRINTF("MQTT RX: %s = %s\n", topic, payloadStr.c_str());
+    String controlTopicBase = String(MQTT_CONTROL_TOPIC);
     
-    // Parse control commands
     if (topicStr.startsWith(controlTopicBase)) {
         String command = topicStr.substring(controlTopicBase.length());
+        if (command.startsWith("/")) command.remove(0, 1);
         
+        // Dispatch to individual handlers
         if (command == "setpoint") {
-            float newSetpoint = payloadStr.toFloat();
-            if (newSetpoint >= 0 && newSetpoint <= 240) {
-                modbusTCP.Hreg(REG_BEAN_SP, (uint16_t)(newSetpoint * 10));
-                DEBUG_PRINTF("MQTT: Setpoint set to %.1f°C\n", newSetpoint);
-            }
+            handleControlSetpoint(payloadStr);
         }
         else if (command == "fan_pwm") {
-            int newFanPWM = payloadStr.toInt();
-            if (newFanPWM >= 0 && newFanPWM <= 255) {
-                modbusTCP.Hreg(REG_FAN_PWM, newFanPWM);
-                DEBUG_PRINTF("MQTT: Fan PWM set to %d\n", newFanPWM);
-            }
+            handleControlFan(payloadStr);
         }
         else if (command == "heater_pwm") {
-            int newHeaterPWM = payloadStr.toInt();
-            if (newHeaterPWM >= 0 && newHeaterPWM <= 100) {
-                modbusTCP.Hreg(REG_HEATER_PWM, newHeaterPWM);
-                DEBUG_PRINTF("MQTT: Heater PWM set to %d%%\n", newHeaterPWM);
-            }
+            handleControlHeater(payloadStr);
         }
         else if (command == "mode") {
-            if (payloadStr == "manual" || payloadStr == "0") {
-                modbusTCP.Hreg(REG_CONTROL_MODE, MODE_MANUAL);
-                DEBUG_PRINTLN("MQTT: Mode set to Manual");
-            } else if (payloadStr == "auto" || payloadStr == "1") {
-                modbusTCP.Hreg(REG_CONTROL_MODE, MODE_AUTO);
-                DEBUG_PRINTLN("MQTT: Mode set to Auto");
-            }
+            handleControlMode(payloadStr);
         }
         else if (command == "heater_enable") {
-            int enable = payloadStr.toInt();
-            modbusTCP.Hreg(REG_OVERRIDE_HEATER, enable);
-            DEBUG_PRINTF("MQTT: Heater enable set to %d\n", enable);
+            handleControlEnable(payloadStr);
+        }
+        else if (command == "pid") {
+            handleControlPID(payloadStr);
         }
         else if (command == "emergency_stop") {
-            if (payloadStr == "1" || payloadStr == "true") {
-                DEBUG_PRINTLN("MQTT: EMERGENCY STOP RECEIVED!");
-                modbusTCP.Hreg(REG_OVERRIDE_HEATER, 0);
-                modbusTCP.Hreg(REG_FAN_PWM, 255);
-                ledcWrite(0, 0);
-                ledcWrite(1, 255);
-            }
+            handleEmergencyStop(payloadStr);
         }
     }
 }
@@ -360,17 +361,23 @@ void publishMQTTTelemetry() {
     doc["beanTemp"] = round(beanTemperature * 10) / 10.0;
     doc["envTemp"] = round(envTemperature * 10) / 10.0;
     doc["rateOfRise"] = round(getRateOfRise() * 100) / 100.0;
-    doc["heaterPWM"] = static_cast<int>(heaterOutput * 100 / 255);
+    doc["heaterPWM"] = static_cast<int>(heaterOutput * 100 / 255);  // Convert to percentage like original
     doc["fanPWM"] = fanPWM;
     doc["setpoint"] = round(beanSetpoint * 10) / 10.0;
-    doc["controlMode"] = modbusTCP.Hreg(REG_CONTROL_MODE);
-    doc["heaterEnable"] = modbusTCP.Hreg(REG_OVERRIDE_HEATER);
+    doc["controlMode"] = controlMode;
+    doc["heaterEnable"] = heaterEnabled ? 1 : 0;  // Match original field name
     doc["uptime"] = millis() / 1000;
+    doc["Kp"] = Kp;
+    doc["Ki"] = Ki;  
+    doc["Kd"] = Kd;
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["rssi"] = WiFi.RSSI();
+    doc["systemStatus"] = systemStatus;
     
     String payload;
     serializeJson(doc, payload);
     
-    mqttClient.publish(telemetryTopic.c_str(), payload.c_str());
+    mqttClient.publish(MQTT_TELEMETRY_TOPIC, payload.c_str());
     DEBUG_PRINTF("MQTT: Published telemetry (%d bytes)\n", payload.length());
 }
 
@@ -381,37 +388,36 @@ void publishMQTTStatus(const String& status) {
     doc["ip"] = WiFi.localIP().toString();
     doc["rssi"] = WiFi.RSSI();
     doc["freeHeap"] = ESP.getFreeHeap();
-    doc["version"] = "1.0.0-mqtt";
+    doc["version"] = "2.0.0-mqtt-only";
     
     String payload;
     serializeJson(doc, payload);
     
-    mqttClient.publish(statusTopic.c_str(), payload.c_str(), true);
+    mqttClient.publish(MQTT_STATUS_TOPIC, payload.c_str(), true);
 }
 
 void updateRateOfRise(float currentTemp) {
     tempHistory[historyIndex] = currentTemp;
     timeHistory[historyIndex] = millis();
-    historyIndex = (historyIndex + 1) % 10;
-    if (historyCount < 10) historyCount++;
+    historyIndex = (historyIndex + 1) % RATE_HISTORY_SIZE;
+    if (historyCount < RATE_HISTORY_SIZE) historyCount++;
 }
 
 float getRateOfRise() {
     if (historyCount < 3) return 0.0;
     
-    int startIdx = (historyIndex - historyCount + 10) % 10;
-    int endIdx = (historyIndex - 1 + 10) % 10;
+    int startIdx = (historyIndex - historyCount + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
+    int endIdx = (historyIndex - 1 + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
     
     float tempDiff = tempHistory[endIdx] - tempHistory[startIdx];
     float timeDiff = (timeHistory[endIdx] - timeHistory[startIdx]) / 1000.0;
     
     if (timeDiff > 0) {
-        return (tempDiff / timeDiff) * 60.0; // °C/minute
+        return (tempDiff / timeDiff) * 60.0;
     }
     return 0.0;
 }
 
-// Keep all existing functions unchanged
 void initializePins() {
     pinMode(SSR_PIN, OUTPUT);
     pinMode(FAN_PIN, OUTPUT);
@@ -424,66 +430,8 @@ void applyCalibration() {
     envTemperature += envTempOffset;
 }
 
-void connectToWiFi(const char* ssid, const char* password) {
-    DEBUG_PRINTLN("Connecting to WiFi...");
-    WiFi.begin(ssid, password);
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
-        delay(500);
-        DEBUG_PRINT(".");
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        DEBUG_PRINTLN("\nWiFi connection failed! Running in offline mode.");
-    } else {
-        DEBUG_PRINTLN("\nWiFi connected!");
-        DEBUG_PRINTF("IP Address: %s\n", WiFi.localIP().toString().c_str());
-    }
-}
-
-void handleWebServer() {
-    // Keep existing web interface unchanged
-    String html = "<html><head>";
-    html += "<title>ESP32 Coffee Roaster</title>";
-    // ... rest of existing HTML code unchanged
-    server.send(200, "text/html", html);
-}
-
-void handleDataRequest() {
-    String json = "{";
-    json += "\"beanTemp\":" + String(beanTemperature, 2) + ",";
-    json += "\"envTemp\":" + String(envTemperature, 2) + ",";
-    json += "\"setpoint\":" + String(beanSetpoint, 2) + ",";
-    json += "\"fanPwm\":" + String(fanPWM) + ",";
-    json += "\"heaterPwm\":" + String(static_cast<int>(heaterOutput)) + ",";
-    json += "\"controlMode\":" + String(modbusTCP.Hreg(REG_CONTROL_MODE)) + ",";
-    json += "\"heaterOverride\":" + String(modbusTCP.Hreg(REG_OVERRIDE_HEATER)) + ",";
-    json += "\"Kp\":" + String(Kp, 2) + ",";
-    json += "\"Ki\":" + String(Ki, 2) + ",";
-    json += "\"Kd\":" + String(Kd, 2) + ",";
-    json += "\"rateOfRise\":" + String(getRateOfRise(), 2) + ",";
-    json += "\"mqttConnected\":" + String(mqttClient.connected() ? "true" : "false");
-    json += "}";
-    server.send(200, "application/json", json);
-}
-
-void autoTunePID() {
-    DEBUG_PRINTLN("Starting PID Auto-Tune...");
-    DEBUG_PRINTLN("Auto-Tune Complete!");
-}
-
 void updatePIDParameters() {
-    double newKp = modbusTCP.Hreg(REG_KP) / 10.0;
-    double newKi = modbusTCP.Hreg(REG_KI) / 10.0;
-    double newKd = modbusTCP.Hreg(REG_KD) / 10.0;
-
-    if (newKp != Kp || newKi != Ki || newKd != Kd) {
-        Kp = newKp;
-        Ki = newKi;
-        Kd = newKd;
-        beanPID.SetTunings(Kp, Ki, Kd);
-        DEBUG_PRINTF("PID Parameters Updated: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
-        savePIDParameters();
-    }
+    // This function is kept for compatibility but PID params are now updated via MQTT
 }
 
 void savePIDParameters() {
@@ -491,13 +439,166 @@ void savePIDParameters() {
     EEPROM.put(8, Ki);
     EEPROM.put(16, Kd);
     EEPROM.commit();
-    DEBUG_PRINTLN("PID Parameters Saved to EEPROM");
+    DEBUG_PRINTLN(F("PID Parameters Saved to EEPROM"));
 }
 
 void loadPIDParameters() {
-    EEPROM.get(0, Kp);
-    EEPROM.get(8, Ki);
-    EEPROM.get(16, Kd);
+    // Read PID parameters from EEPROM
+    double tempKp, tempKi, tempKd;
+    EEPROM.get(0, tempKp);
+    EEPROM.get(8, tempKi);
+    EEPROM.get(16, tempKd);
+    
+    // Validate EEPROM data (check for reasonable PID values)
+    bool validData = true;
+    if (isnan(tempKp) || tempKp <= 0 || tempKp > 1000) validData = false;
+    if (isnan(tempKi) || tempKi < 0 || tempKi > 100) validData = false;
+    if (isnan(tempKd) || tempKd < 0 || tempKd > 1000) validData = false;
+    
+    if (validData) {
+        // Use EEPROM values
+        Kp = tempKp;
+        Ki = tempKi;
+        Kd = tempKd;
+        DEBUG_PRINTLN(F("PID Parameters Loaded from EEPROM"));
+        DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
+    } else {
+        // Use default values and save them to EEPROM
+        Kp = DEFAULT_KP;
+        Ki = DEFAULT_KI;
+        Kd = DEFAULT_KD;
+        savePIDParameters();
+        DEBUG_PRINTLN(F("EEPROM invalid - using default PID parameters"));
+        DEBUG_PRINTF("Default PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
+    }
+    
+    // Apply the PID parameters to the controller
     beanPID.SetTunings(Kp, Ki, Kd);
-    DEBUG_PRINTLN("PID Parameters Loaded from EEPROM");
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    handleMQTTMessage(topic, payload, length);
+}
+
+void checkWiFiConnection() {
+    static unsigned long lastWiFiCheck = 0;
+    const unsigned long wifiCheckInterval = WIFI_CHECK_INTERVAL;
+    
+    if (millis() - lastWiFiCheck >= wifiCheckInterval) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            DEBUG_PRINTLN(F("WiFi disconnected. Reconnecting..."));
+            WiFi.disconnect();
+            WiFi.begin(ssid, password);
+        }
+    }
+}
+
+void updateSystemStatus() {
+    if (millis() - lastStatusUpdate >= statusUpdateInterval) {
+        lastStatusUpdate = millis();
+        
+        SystemStatus oldStatus = systemStatus;
+        systemStatus = SYSTEM_OK;
+        
+        // Check connectivity
+        SystemStatus connStatus = checkConnectivity();
+        if (connStatus != SYSTEM_OK) systemStatus = connStatus;
+        
+        // Check sensors
+        SystemStatus sensorStatus = checkSensors();
+        if (sensorStatus != SYSTEM_OK) systemStatus = sensorStatus;
+        
+        // Log status changes
+        if (systemStatus != oldStatus) {
+            DEBUG_PRINTF_P(PSTR("System status changed: %d -> %d\n"), oldStatus, systemStatus);
+        }
+    }
+}
+
+SystemStatus checkConnectivity() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return WIFI_ERROR;
+    }
+    if (!mqttClient.connected()) {
+        return MQTT_ERROR;
+    }
+    return SYSTEM_OK;
+}
+
+SystemStatus checkSensors() {
+    if (isnan(beanTemperature) || isnan(envTemperature)) {
+        return SENSOR_ERROR;
+    }
+    if (beanTemperature < -50 || beanTemperature > 300) {
+        return SENSOR_ERROR;
+    }
+    if (envTemperature < -50 || envTemperature > 300) {
+        return SENSOR_ERROR;
+    }
+    return SYSTEM_OK;
+}
+
+void handleControlSetpoint(const String& payload) {
+    float newSetpoint = payload.toFloat();
+    if (newSetpoint >= MIN_BEAN_TEMP && newSetpoint <= MAX_BEAN_TEMP) {
+        beanSetpoint = newSetpoint;
+        DEBUG_PRINTF_P(PSTR("MQTT: Setpoint set to %.1f°C\n"), newSetpoint);
+    }
+}
+
+void handleControlFan(const String& payload) {
+    int newFanPWM = payload.toInt();
+    if (newFanPWM >= 0 && newFanPWM <= 255) {
+        fanPWM = newFanPWM;
+        DEBUG_PRINTF_P(PSTR("MQTT: Fan PWM set to %d\n"), newFanPWM);
+    }
+}
+
+void handleControlHeater(const String& payload) {
+    int newHeaterPWM = payload.toInt();
+    if (newHeaterPWM >= MIN_HEATER_PWM && newHeaterPWM <= MAX_HEATER_PWM) {
+        heaterOutput = newHeaterPWM * 255 / 100;  // Convert percentage to 0-255
+        DEBUG_PRINTF_P(PSTR("MQTT: Heater PWM set to %d%%\n"), newHeaterPWM);
+    }
+}
+
+void handleControlMode(const String& payload) {
+    if (payload == "manual" || payload == "0") {
+        controlMode = MODE_MANUAL;
+        DEBUG_PRINTLN(F("MQTT: Mode set to Manual"));
+    } else if (payload == "auto" || payload == "1") {
+        controlMode = MODE_AUTO;
+        DEBUG_PRINTLN(F("MQTT: Mode set to Auto"));
+    }
+}
+
+void handleControlEnable(const String& payload) {
+    heaterEnabled = (payload == "1" || payload == "true");
+    DEBUG_PRINTF_P(PSTR("MQTT: Heater enable set to %d\n"), heaterEnabled ? 1 : 0);
+}
+
+void handleControlPID(const String& payload) {
+    // Expect JSON: {"kp": 15.0, "ki": 1.0, "kd": 25.0}
+    DynamicJsonDocument doc(256);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+        if (doc.containsKey("kp")) Kp = doc["kp"];
+        if (doc.containsKey("ki")) Ki = doc["ki"];
+        if (doc.containsKey("kd")) Kd = doc["kd"];
+        beanPID.SetTunings(Kp, Ki, Kd);
+        savePIDParameters();
+        DEBUG_PRINTF_P(PSTR("MQTT: PID updated Kp=%.2f, Ki=%.2f, Kd=%.2f\n"), Kp, Ki, Kd);
+    }
+}
+
+void handleEmergencyStop(const String& payload) {
+    if (payload == "1" || payload == "true") {
+        DEBUG_PRINTLN(F("MQTT: EMERGENCY STOP RECEIVED!"));
+        heaterEnabled = false;
+        fanPWM = 255;
+        heaterOutput = 0;
+        ledcWrite(0, 0);
+        ledcWrite(1, 255);
+    }
 }
