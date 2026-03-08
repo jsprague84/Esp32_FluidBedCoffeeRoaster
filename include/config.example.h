@@ -92,7 +92,7 @@ extern const char* password;
 #define AUTOTUNE_OUTPUT_BIAS 50
 #define AUTOTUNE_MIN_PEAKS 3
 #define AUTOTUNE_MIN_VALLEYS 3
-#define AUTOTUNE_TOTAL_STEPS 8
+#define AUTOTUNE_TOTAL_STEPS 12
 #define AUTOTUNE_SETPOINT_TOLERANCE 2.5
 #define AUTOTUNE_STABILIZATION_TIME 45000
 #define AUTOTUNE_STABILITY_ROR 2.0
@@ -100,6 +100,11 @@ extern const char* password;
 // Minimum fraction of target temp for equilibrium acceptance (0.0-1.0)
 #define AUTOTUNE_EQUIL_MIN_PCT 0.75f
 #define AUTOTUNE_RELAY_HYST 1.0
+// Fallback analysis minimum thresholds
+#define AUTOTUNE_FALLBACK_MIN_PERIOD 10.0f
+#define AUTOTUNE_FALLBACK_MIN_AMPLITUDE 1.0f
+// Oscillation consistency tolerance (max relative deviation from mean)
+#define AUTOTUNE_CONSISTENCY_TOLERANCE 0.10f
 // EMA noise filter alpha (0.0-1.0, lower = more smoothing)
 #define AUTOTUNE_EMA_ALPHA 0.3f
 // Temperature history buffer size (samples at ~1Hz)

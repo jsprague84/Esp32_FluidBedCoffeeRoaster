@@ -52,6 +52,9 @@ static unsigned long autoTuneTempTimeHistory[AUTOTUNE_TEMP_HISTORY_SIZE];
 static int autoTuneTempHistoryIndex = 0;
 static int autoTuneTempHistoryCount = 0;
 
+// Quality metrics for reporting
+static float autoTuneConsistencyPct = 0.0f;
+
 // Status publishing interval
 static unsigned long lastAutoTuneStatusPublish = 0;
 static const unsigned long autoTuneStatusPublishInterval = 2000;
@@ -473,20 +476,30 @@ static bool calculateAutoTunePIDParameters() {
     float avgPeriod = 0;
     float avgAmplitude = 0;
     bool computed = false;
+    autoTuneConsistencyPct = 0.0f;
 
-    if (autoTunePeakCount >= 2 && autoTuneValleyCount >= 2) {
+    // Primary analysis: use peaks/valleys, discarding first 2 as transient
+    const int transientSkip = 2;
+    int usablePeaks = autoTunePeakCount - transientSkip;
+    int usableValleys = autoTuneValleyCount - transientSkip;
+
+    if (usablePeaks >= 2 && usableValleys >= 2) {
+        // Compute average period from post-transient peaks
         float totalPeriod = 0; int periodCount = 0;
-        for (int i = 1; i < autoTunePeakCount; i++) {
+        for (int i = transientSkip + 1; i < autoTunePeakCount; i++) {
             float period = autoTunePeaks[i].time - autoTunePeaks[i-1].time;
             if (period > 0) { totalPeriod += period; periodCount++; }
         }
         if (periodCount > 0) avgPeriod = totalPeriod / periodCount;
 
+        // Compute amplitudes from post-transient peak-valley pairs
         float totalAmplitude = 0; int amplitudeCount = 0;
-        for (int i = 0; i < autoTunePeakCount; i++) {
-            for (int j = 0; j < autoTuneValleyCount; j++) {
+        float amplitudes[10] = {0};
+        for (int i = transientSkip; i < autoTunePeakCount; i++) {
+            for (int j = transientSkip; j < autoTuneValleyCount; j++) {
                 if (fabs(autoTunePeaks[i].time - autoTuneValleys[j].time) < (avgPeriod / 2 + 2)) {
                     float amplitude = fabs(autoTunePeaks[i].temperature - autoTuneValleys[j].temperature) / 2.0f;
+                    if (amplitudeCount < 10) amplitudes[amplitudeCount] = amplitude;
                     totalAmplitude += amplitude;
                     amplitudeCount++;
                     break;
@@ -495,10 +508,36 @@ static bool calculateAutoTunePIDParameters() {
         }
         if (periodCount > 0 && amplitudeCount > 0) {
             avgAmplitude = totalAmplitude / amplitudeCount;
-            computed = true;
+
+            // Consistency validation: check last 3 amplitudes within tolerance of their mean
+            if (amplitudeCount >= 3) {
+                float last3[3];
+                for (int i = 0; i < 3; i++) last3[i] = amplitudes[amplitudeCount - 3 + i];
+                float mean3 = (last3[0] + last3[1] + last3[2]) / 3.0f;
+
+                float maxDev = 0.0f;
+                for (int i = 0; i < 3; i++) {
+                    float dev = fabs(last3[i] - mean3) / mean3;
+                    if (dev > maxDev) maxDev = dev;
+                }
+                autoTuneConsistencyPct = 1.0f - maxDev;
+
+                if (maxDev > AUTOTUNE_CONSISTENCY_TOLERANCE) {
+                    DEBUG_PRINTF("Auto-tune consistency check FAILED: amplitudes=[%.2f, %.2f, %.2f], mean=%.2f, maxDev=%.1f%%\n",
+                                 last3[0], last3[1], last3[2], mean3, maxDev * 100.0f);
+                    computed = false;
+                } else {
+                    DEBUG_PRINTF("Auto-tune consistency OK: %.0f%% (amplitudes=[%.2f, %.2f, %.2f])\n",
+                                 autoTuneConsistencyPct * 100.0f, last3[0], last3[1], last3[2]);
+                    computed = true;
+                }
+            } else {
+                computed = true;
+            }
         }
     }
 
+    // Fallback analysis with tightened thresholds
     if (!computed) {
         const float ref = autoTuneSetpoint;
         int crossings[10]; int crossCount = 0;
@@ -527,7 +566,10 @@ static bool calculateAutoTunePIDParameters() {
         }
         float range = (tmax > tmin) ? (tmax - tmin) : 0;
         avgAmplitude = range / 2.0f;
-        computed = (avgPeriod > 0.5f && avgAmplitude > 0.2f);
+        computed = (avgPeriod > AUTOTUNE_FALLBACK_MIN_PERIOD && avgAmplitude > AUTOTUNE_FALLBACK_MIN_AMPLITUDE);
+        if (computed) {
+            DEBUG_PRINTF("Auto-tune fallback analysis: period=%.1fs, amplitude=%.2f°C\n", avgPeriod, avgAmplitude);
+        }
     }
 
     if (!computed) {
@@ -567,4 +609,5 @@ static void resetAutoTuneData() {
     autoTuneFilterInitialized = false;
     autoTuneRunningMax = -1e9f;
     autoTuneRunningMin = 1e9f;
+    autoTuneConsistencyPct = 0.0f;
 }
