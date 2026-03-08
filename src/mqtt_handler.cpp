@@ -9,6 +9,7 @@
 #include "heater_control.h"
 #include "safety.h"
 #include "temperature.h"
+#include "autotune.h"
 
 // MQTT client instance
 static ESP32MQTTClient mqttClient;
@@ -28,10 +29,7 @@ static void handleControlEnable(const char* payload, size_t len);
 static void handleControlPID(const char* payload, size_t len);
 static void handleEmergencyStop(const char* payload, size_t len);
 
-// Forward declarations for autotune handlers (called from main.cpp until US-013 extracts them)
-extern void handleAutoTuneStartMsg(const char* payload, size_t len);
-extern void handleAutoTuneStopMsg(const char* payload, size_t len);
-extern void handleAutoTuneApplyMsg(const char* payload, size_t len);
+// Autotune handlers are now in autotune.cpp via autotune.h
 
 // ESP-IDF 5.x MQTT event handler
 void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -84,17 +82,17 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
         // Subscribe to auto-tune topics
         mqttClient.subscribe(std::string(MQTT_AUTOTUNE_START_TOPIC),
             [](const std::string &message) {
-                handleAutoTuneStartMsg(message.c_str(), message.length());
+                handleAutoTuneStart(message.c_str(), message.length());
             });
 
         mqttClient.subscribe(std::string(MQTT_AUTOTUNE_STOP_TOPIC),
             [](const std::string &message) {
-                handleAutoTuneStopMsg(message.c_str(), message.length());
+                handleAutoTuneStop(message.c_str(), message.length());
             });
 
         mqttClient.subscribe(std::string(MQTT_AUTOTUNE_APPLY_TOPIC),
             [](const std::string &message) {
-                handleAutoTuneApplyMsg(message.c_str(), message.length());
+                handleAutoTuneApply(message.c_str(), message.length());
             });
 
         // Publish online status
@@ -193,25 +191,7 @@ void publishStatus(const char* status) {
                        std::string(statusBuf, len), 0, true);
 }
 
-void publishAutoTuneStatus() {
-    if (!mqttClient.isConnected()) return;
-
-    // Auto-tune state is still in main.cpp until US-013 extracts it.
-    // This function is called from main.cpp which builds the JSON doc.
-    // For now, provide the publish mechanism.
-    // The actual JSON building is done in main.cpp's publishAutoTuneStatusImpl()
-    extern void publishAutoTuneStatusImpl();
-    publishAutoTuneStatusImpl();
-}
-
-void publishAutoTuneResults() {
-    if (!mqttClient.isConnected()) return;
-
-    extern void publishAutoTuneResultsImpl();
-    publishAutoTuneResultsImpl();
-}
-
-// Helper: publish raw JSON buffer to autotune status topic
+// Raw publish helpers called by autotune.cpp
 void mqttPublishAutoTuneStatus(const char* buf, size_t len) {
     mqttClient.publish(std::string(MQTT_AUTOTUNE_STATUS_TOPIC),
                        std::string(buf, len), 0, true);
