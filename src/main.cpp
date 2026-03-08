@@ -1,12 +1,10 @@
 // ESP32 Coffee Roaster - Streamlined MQTT-Only Version
 // Core control functions with WiFi, OTA, and MQTT communication
 
-#include <SPI.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <PID_v1.h>
-#include "MAX6675Handler.h"
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -16,13 +14,14 @@
 #include "esp_task_wdt.h"
 #include "debug.h"
 #include "roaster_state.h"
+#include "temperature.h"
 
 // Preferences for NVS-based PID storage
 Preferences preferences;
 
-// Hardware Pin Definitions (now in config.h)
-#define BT_CS   BT_CS_PIN
-#define ET_CS   ET_CS_PIN
+// WiFi credentials (declared extern in config.h)
+const char* ssid = "jswifi";
+const char* password = "helloworld";
 
 // Global roaster state
 RoasterState state = {};
@@ -38,17 +37,10 @@ PubSubClient mqttClient(espClient);
 PID beanPID(&state.beanTemperature, &state.heaterOutput, &state.beanSetpoint, DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, DIRECT);
 
 // Timing variables
-unsigned long lastTempRead = 0;
 unsigned long lastPidCompute = 0;
 unsigned long lastSerialOutput = 0;
 unsigned long lastMqttPublish = 0;
 unsigned long lastMqttReconnect = 0;
-
-// Rate of Rise calculation
-float tempHistory[RATE_HISTORY_SIZE];
-unsigned long timeHistory[RATE_HISTORY_SIZE];
-int historyIndex = 0;
-int historyCount = 0;
 
 // Auto-tune state variables
 typedef enum {
@@ -99,9 +91,6 @@ int autoTuneTempHistoryCount = 0;
 unsigned long lastAutoTuneStatusPublish = 0;
 const unsigned long autoTuneStatusPublishInterval = 2000; // Publish status every 2 seconds
 
-MAX6675Handler beanThermocouple(BT_CS);
-MAX6675Handler envThermocouple(ET_CS);
-
 // Function prototypes
 void initializePins();
 void initStateDefaults();
@@ -110,9 +99,6 @@ void connectMQTT();
 void handleMQTTMessage(char* topic, byte* payload, unsigned int length);
 void publishMQTTTelemetry();
 void publishMQTTStatus(const String& status);
-void updateRateOfRise(float currentTemp);
-float getRateOfRise();
-void applyCalibration();
 void updatePIDParameters();
 void savePIDParameters();
 void loadPIDParameters();
@@ -194,11 +180,7 @@ void setup() {
         Serial.println(F("\nWiFi connection failed!"));
     }
 
-    // Initialize SPI once, then thermocouples
-    SPI.begin();
-    beanThermocouple.begin();
-    envThermocouple.begin();
-    DEBUG_PRINTLN(F("MAX6675 Initialized"));
+    initTemperature();
 
     // Configure OTA
     ArduinoOTA.setHostname(MQTT_CLIENT_ID);
@@ -274,16 +256,7 @@ void loop() {
     mqttClient.loop();
 
     // Read Temperatures
-    if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
-        lastTempRead = millis();
-        state.beanTemperature = beanThermocouple.readTemperature();
-        state.envTemperature = envThermocouple.readTemperature();
-
-        if (!isnan(state.beanTemperature) && !isnan(state.envTemperature)) {
-            applyCalibration();
-            updateRateOfRise(state.beanTemperature);
-        }
-    }
+    readTemperatures();
 
     // Control fan — only write when value changes
     if (state.fanPWM != state.prevFanPWM) {
@@ -531,38 +504,12 @@ void publishMQTTStatus(const String& status) {
     mqttClient.publish(MQTT_STATUS_TOPIC, statusBuf, true);
 }
 
-void updateRateOfRise(float currentTemp) {
-    tempHistory[historyIndex] = currentTemp;
-    timeHistory[historyIndex] = millis();
-    historyIndex = (historyIndex + 1) % RATE_HISTORY_SIZE;
-    if (historyCount < RATE_HISTORY_SIZE) historyCount++;
-}
-
-float getRateOfRise() {
-    if (historyCount < 3) return 0.0;
-
-    int startIdx = (historyIndex - historyCount + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
-    int endIdx = (historyIndex - 1 + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
-
-    float tempDiff = tempHistory[endIdx] - tempHistory[startIdx];
-    float timeDiff = (timeHistory[endIdx] - timeHistory[startIdx]) / 1000.0;
-
-    if (timeDiff > 0) {
-        return (tempDiff / timeDiff) * 60.0;
-    }
-    return 0.0;
-}
 
 void initializePins() {
     pinMode(SSR_PIN, OUTPUT);
     pinMode(FAN_PIN, OUTPUT);
     digitalWrite(SSR_PIN, LOW);
     digitalWrite(FAN_PIN, LOW);
-}
-
-void applyCalibration() {
-    state.beanTemperature += state.beanTempOffset;
-    state.envTemperature += state.envTempOffset;
 }
 
 void updatePIDParameters() {

@@ -11,8 +11,8 @@
 #endif
 
 // WiFi Configuration
-const char* ssid = "YourWiFiSSID";
-const char* password = "YourWiFiPassword";
+extern const char* ssid;
+extern const char* password;
 
 // MQTT Configuration
 #define MQTT_BROKER "YourMQTTBrokerAddress"
