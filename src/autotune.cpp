@@ -30,7 +30,6 @@ static bool autoTuneUsedFallback = false;
 static bool autoTuneReachedSetpoint = false;
 static float autoTuneStepTimeout = AUTOTUNE_MAX_STEP_TIME;
 static unsigned long autoTuneRorStableStartTime = 0;
-static unsigned long autoTuneFastTrackStartTime = 0;
 static bool autoTuneOutputHigh = false;
 
 // EMA noise filter for auto-tune temperature readings
@@ -305,8 +304,8 @@ void updateAutoTune() {
     }
 
     if (autoTuneState == AUTOTUNE_HEATING) {
+        // Heater output: full power far from setpoint, proportional approaching, bias-only near
         double tempError = autoTuneSetpoint - state.beanTemperature;
-
         if (tempError > 50) {
             state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
         } else if (tempError > 10) {
@@ -314,8 +313,7 @@ void updateAutoTune() {
             double pct = autoTuneOutputBias + autoTuneOutputAmplitude * powerRatio;
             state.heaterOutput = pct * 255 / 100;
         } else if (tempError > 0) {
-            double pct = autoTuneOutputBias;
-            state.heaterOutput = pct * 255 / 100;
+            state.heaterOutput = autoTuneOutputBias * 255 / 100;
         } else {
             state.heaterOutput = 0;
         }
@@ -325,80 +323,55 @@ void updateAutoTune() {
 
         // Use filtered temperature for setpoint comparisons
         float absErr = fabs(autoTuneFilteredTemp - autoTuneSetpoint);
+        float absRor = fabs(getRateOfRise());
+
+        // --- Path 1 (Normal): Within tolerance AND low RoR for STABILITY_ROR_TIME ---
         if (absErr <= AUTOTUNE_SETPOINT_TOLERANCE) {
             if (!autoTuneReachedSetpoint) {
                 autoTuneReachedSetpoint = true;
-                autoTuneStabilizationStartTime = now;
                 autoTuneRorStableStartTime = 0;
-                autoTuneFastTrackStartTime = 0;
-                DEBUG_PRINTF("Auto-tune reached setpoint %.1f°C, starting stabilization\n", autoTuneSetpoint);
+                DEBUG_PRINTF("Auto-tune HEATING: reached setpoint %.1f°C\n", autoTuneSetpoint);
             }
-            float absRor = fabs(getRateOfRise());
             if (absRor <= AUTOTUNE_STABILITY_ROR) {
                 if (autoTuneRorStableStartTime == 0) autoTuneRorStableStartTime = now;
             } else {
                 autoTuneRorStableStartTime = 0;
             }
-
-            bool timeStable = (now - autoTuneStabilizationStartTime) >= AUTOTUNE_STABILIZATION_TIME;
-            bool rorStable = (autoTuneRorStableStartTime != 0) && ((now - autoTuneRorStableStartTime) >= AUTOTUNE_STABILITY_ROR_TIME);
-
-            if (timeStable || rorStable) {
+            if (autoTuneRorStableStartTime != 0 && (now - autoTuneRorStableStartTime) >= AUTOTUNE_STABILITY_ROR_TIME) {
                 autoTuneState = AUTOTUNE_STABILIZING;
                 autoTuneCurrentStep = 1;
                 autoTuneStepStartTime = now;
-                DEBUG_PRINTLN(F("Auto-tune stabilization complete, starting oscillation test"));
-            }
-        } else if (autoTuneReachedSetpoint) {
-            if (absErr > (AUTOTUNE_SETPOINT_TOLERANCE + AUTOTUNE_STABILITY_HYST)) {
-                autoTuneReachedSetpoint = false;
-                autoTuneStabilizationStartTime = now;
-                autoTuneRorStableStartTime = 0;
-                DEBUG_PRINTLN(F("Auto-tune: left tolerance band, resetting stabilization timer"));
+                DEBUG_PRINTLN(F("Auto-tune HEATING → STABILIZING via Path 1 (normal: at setpoint with low RoR)"));
             }
         } else {
-            if (absErr <= (AUTOTUNE_SETPOINT_TOLERANCE + AUTOTUNE_FASTTRACK_EXTRA_BAND)) {
-                float absRor = fabs(getRateOfRise());
-                if (absRor <= AUTOTUNE_STABILITY_ROR) {
-                    if (autoTuneFastTrackStartTime == 0) autoTuneFastTrackStartTime = now;
-                } else {
-                    autoTuneFastTrackStartTime = 0;
-                }
-                if (autoTuneFastTrackStartTime != 0 && (now - autoTuneFastTrackStartTime) >= AUTOTUNE_FASTTRACK_ROR_TIME) {
-                    autoTuneState = AUTOTUNE_STABILIZING;
-                    autoTuneCurrentStep = 1;
-                    autoTuneStepStartTime = now;
-                    DEBUG_PRINTLN(F("Auto-tune fast-track stabilization reached (near setpoint, low RoR)"));
-                }
-            } else {
-                autoTuneFastTrackStartTime = 0;
-            }
+            autoTuneReachedSetpoint = false;
+            autoTuneRorStableStartTime = 0;
+        }
 
-            float absRor2 = fabs(getRateOfRise());
-            if (state.beanTemperature >= AUTOTUNE_EQUIL_MIN_TEMP && absRor2 <= AUTOTUNE_STABILITY_ROR) {
-                if (autoTuneRorStableStartTime == 0) autoTuneRorStableStartTime = now;
+        // --- Path 2 (Equilibrium): >= 75% of target AND low RoR for STABILIZATION_TIME ---
+        if (autoTuneState == AUTOTUNE_HEATING && !autoTuneReachedSetpoint) {
+            float equilMinTemp = AUTOTUNE_EQUIL_MIN_PCT * autoTuneTargetTemp;
+            if (autoTuneFilteredTemp >= equilMinTemp && absRor <= AUTOTUNE_STABILITY_ROR) {
+                if (autoTuneStabilizationStartTime == 0) autoTuneStabilizationStartTime = now;
             } else {
-                autoTuneRorStableStartTime = 0;
+                autoTuneStabilizationStartTime = 0;
             }
-            if (autoTuneRorStableStartTime != 0 && (now - autoTuneRorStableStartTime) >= AUTOTUNE_FASTTRACK_ROR_TIME) {
-                autoTuneSetpoint = state.beanTemperature;
+            if (autoTuneStabilizationStartTime != 0 && (now - autoTuneStabilizationStartTime) >= AUTOTUNE_STABILIZATION_TIME) {
+                autoTuneSetpoint = autoTuneFilteredTemp;
                 autoTuneState = AUTOTUNE_STABILIZING;
                 autoTuneCurrentStep = 1;
                 autoTuneStepStartTime = now;
-                autoTuneReachedSetpoint = true;
-                autoTuneStabilizationStartTime = now;
-                DEBUG_PRINTF("Auto-tune equilibrium accepted at %.1f°C, proceeding to stabilizing.\n", autoTuneSetpoint);
+                DEBUG_PRINTF("Auto-tune HEATING → STABILIZING via Path 2 (equilibrium at %.1f°C)\n", autoTuneSetpoint);
             }
         }
 
-        if (now - autoTuneStartTime >= AUTOTUNE_INITIAL_STEP_TIME) {
-            DEBUG_PRINTLN(F("Auto-tune heating phase timeout: forcing progression using equilibrium"));
-            autoTuneSetpoint = state.beanTemperature;
-            autoTuneState = AUTOTUNE_STABILIZING;
-            autoTuneCurrentStep = 1;
-            autoTuneStepStartTime = now;
-            autoTuneReachedSetpoint = true;
-            autoTuneStabilizationStartTime = now;
+        // --- Path 3 (Timeout): INITIAL_STEP_TIME elapsed → FAILED ---
+        if (autoTuneState == AUTOTUNE_HEATING && (now - autoTuneStartTime >= AUTOTUNE_INITIAL_STEP_TIME)) {
+            DEBUG_PRINTLN(F("Auto-tune HEATING → FAILED via Path 3 (timeout)"));
+            autoTuneState = AUTOTUNE_FAILED;
+            publishAutoTuneStatusMsg();
+            handleAutoTuneStop("", 0);
+            return;
         }
     }
     else if (autoTuneState == AUTOTUNE_STABILIZING) {

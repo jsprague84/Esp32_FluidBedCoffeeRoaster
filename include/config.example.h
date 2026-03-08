@@ -95,12 +95,10 @@ extern const char* password;
 #define AUTOTUNE_TOTAL_STEPS 8
 #define AUTOTUNE_SETPOINT_TOLERANCE 2.5
 #define AUTOTUNE_STABILIZATION_TIME 45000
-#define AUTOTUNE_STABILITY_HYST 1.0
 #define AUTOTUNE_STABILITY_ROR 2.0
 #define AUTOTUNE_STABILITY_ROR_TIME 8000
-#define AUTOTUNE_FASTTRACK_EXTRA_BAND 4.0
-#define AUTOTUNE_FASTTRACK_ROR_TIME 10000
-#define AUTOTUNE_EQUIL_MIN_TEMP 120.0
+// Minimum fraction of target temp for equilibrium acceptance (0.0-1.0)
+#define AUTOTUNE_EQUIL_MIN_PCT 0.75f
 #define AUTOTUNE_RELAY_HYST 1.0
 // EMA noise filter alpha (0.0-1.0, lower = more smoothing)
 #define AUTOTUNE_EMA_ALPHA 0.3f
