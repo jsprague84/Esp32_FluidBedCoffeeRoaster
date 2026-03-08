@@ -37,6 +37,10 @@ static bool autoTuneOutputHigh = false;
 static float autoTuneFilteredTemp = 0.0f;
 static bool autoTuneFilterInitialized = false;
 
+// Running extrema tracking for accurate peak/valley recording
+static float autoTuneRunningMax = -1e9f;
+static float autoTuneRunningMin = 1e9f;
+
 // Auto-tune data storage
 static PeakValley autoTunePeaks[10];
 static PeakValley autoTuneValleys[10];
@@ -404,6 +408,9 @@ void updateAutoTune() {
             autoTuneState = AUTOTUNE_RUNNING;
             autoTuneCurrentStep = 1;
             autoTuneStepStartTime = now;
+            // Initialize running extrema to current filtered temperature
+            autoTuneRunningMax = autoTuneFilteredTemp;
+            autoTuneRunningMin = autoTuneFilteredTemp;
             if (autoTuneFilteredTemp <= autoTuneSetpoint) {
                 autoTuneOutputHigh = true;
                 state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
@@ -422,25 +429,36 @@ void updateAutoTune() {
         // Use filtered temperature for relay decisions
         float error = autoTuneFilteredTemp - autoTuneSetpoint;
 
+        // Track running extrema between relay toggles
+        if (autoTuneOutputHigh) {
+            if (autoTuneFilteredTemp > autoTuneRunningMax) autoTuneRunningMax = autoTuneFilteredTemp;
+        } else {
+            if (autoTuneFilteredTemp < autoTuneRunningMin) autoTuneRunningMin = autoTuneFilteredTemp;
+        }
+
         bool toggled = false;
         if (autoTuneOutputHigh) {
             if (error >= AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
+                // Record actual peak (running max), not crossing temperature
                 if (autoTunePeakCount < 10) {
-                    autoTunePeaks[autoTunePeakCount].temperature = state.beanTemperature;
+                    autoTunePeaks[autoTunePeakCount].temperature = autoTuneRunningMax;
                     autoTunePeaks[autoTunePeakCount].time = now / 1000.0f;
                     autoTunePeakCount++;
                 }
+                autoTuneRunningMax = -1e9f;  // Reset for next cycle
                 autoTuneOutputHigh = false;
                 toggled = true;
                 state.heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
             }
         } else {
             if (error <= -AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
+                // Record actual valley (running min), not crossing temperature
                 if (autoTuneValleyCount < 10) {
-                    autoTuneValleys[autoTuneValleyCount].temperature = state.beanTemperature;
+                    autoTuneValleys[autoTuneValleyCount].temperature = autoTuneRunningMin;
                     autoTuneValleys[autoTuneValleyCount].time = now / 1000.0f;
                     autoTuneValleyCount++;
                 }
+                autoTuneRunningMin = 1e9f;  // Reset for next cycle
                 autoTuneOutputHigh = true;
                 toggled = true;
                 state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
@@ -574,4 +592,6 @@ static void resetAutoTuneData() {
     autoTuneRecommendedKd = 0;
     autoTuneFilteredTemp = 0.0f;
     autoTuneFilterInitialized = false;
+    autoTuneRunningMax = -1e9f;
+    autoTuneRunningMin = 1e9f;
 }
