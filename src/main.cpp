@@ -4,8 +4,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include <PID_v1.h>
-#include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "driver/gpio.h"
@@ -15,9 +13,7 @@
 #include "debug.h"
 #include "roaster_state.h"
 #include "temperature.h"
-
-// Preferences for NVS-based PID storage
-Preferences preferences;
+#include "heater_control.h"
 
 // WiFi credentials (declared extern in config.h)
 const char* ssid = "jswifi";
@@ -33,11 +29,7 @@ const unsigned long statusUpdateInterval = 5000;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// PID controller uses pointers into state struct
-PID beanPID(&state.beanTemperature, &state.heaterOutput, &state.beanSetpoint, DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, DIRECT);
-
 // Timing variables
-unsigned long lastPidCompute = 0;
 unsigned long lastSerialOutput = 0;
 unsigned long lastMqttPublish = 0;
 unsigned long lastMqttReconnect = 0;
@@ -99,9 +91,6 @@ void connectMQTT();
 void handleMQTTMessage(char* topic, byte* payload, unsigned int length);
 void publishMQTTTelemetry();
 void publishMQTTStatus(const String& status);
-void updatePIDParameters();
-void savePIDParameters();
-void loadPIDParameters();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void checkWiFiConnection();
 void updateSystemStatus();
@@ -151,13 +140,7 @@ void setup() {
 
     initStateDefaults();
     initializePins();
-
-    // Initialize LEDC for PWM (Arduino Core 3.x API)
-    ledcAttach(SSR_PIN, 5000, 8);
-    ledcAttach(FAN_PIN, 5000, 8);
-    gpio_set_drive_capability((gpio_num_t)FAN_PIN, GPIO_DRIVE_CAP_3);
-
-    loadPIDParameters();
+    initHeaterControl();
 
     // Initialize WiFi
     WiFi.mode(WIFI_STA);
@@ -222,10 +205,6 @@ void setup() {
     ArduinoOTA.begin();
     DEBUG_PRINTLN(F("OTA Ready"));
 
-    // Initialize PID
-    beanPID.SetMode(AUTOMATIC);
-    beanPID.SetOutputLimits(0, 255);
-
     DEBUG_PRINTLN(F("Setup complete - All systems ready"));
 
     esp_task_wdt_config_t wdt_config = {
@@ -258,43 +237,8 @@ void loop() {
     // Read Temperatures
     readTemperatures();
 
-    // Control fan — only write when value changes
-    if (state.fanPWM != state.prevFanPWM) {
-        ledcWrite(FAN_PIN, state.fanPWM);
-        state.prevFanPWM = state.fanPWM;
-    }
-
-    // Heater Control Logic
-    if (!state.heaterEnabled) {
-        state.heaterOutput = 0;
-        ledcWrite(SSR_PIN, 0);
-    } else {
-        if (state.controlMode == MODE_MANUAL) {
-            // In manual mode, heaterOutput is set directly via MQTT
-            if (state.fanPWM > SAFETY_MIN_FAN_PWM) {
-                ledcWrite(SSR_PIN, static_cast<int>(state.heaterOutput));
-            } else {
-                ledcWrite(SSR_PIN, 0);
-                DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
-            }
-        } else if (state.controlMode == MODE_AUTO) {
-            if (!isnan(state.beanTemperature)) {
-                if (millis() - lastPidCompute >= PID_COMPUTE_INTERVAL) {
-                    lastPidCompute = millis();
-                    beanPID.Compute();
-                }
-                if (state.fanPWM > SAFETY_MIN_FAN_PWM) {
-                    ledcWrite(SSR_PIN, static_cast<int>(state.heaterOutput));
-                } else {
-                    ledcWrite(SSR_PIN, 0);
-                    DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
-                }
-            } else {
-                DEBUG_PRINTLN(F("Invalid bean temperature! Heater disabled."));
-                ledcWrite(SSR_PIN, 0);
-            }
-        }
-    }
+    // Heater and fan control
+    updateHeaterControl();
 
     // Auto-tune update: run state machine in all active phases
     if (autoTuneState == AUTOTUNE_HEATING ||
@@ -512,32 +456,6 @@ void initializePins() {
     digitalWrite(FAN_PIN, LOW);
 }
 
-void updatePIDParameters() {
-    // This function is kept for compatibility but PID params are now updated via MQTT
-}
-
-void savePIDParameters() {
-    preferences.begin("pid", false);
-    preferences.putDouble("Kp", state.Kp);
-    preferences.putDouble("Ki", state.Ki);
-    preferences.putDouble("Kd", state.Kd);
-    preferences.end();
-    DEBUG_PRINTLN(F("PID Parameters Saved to NVS"));
-}
-
-void loadPIDParameters() {
-    preferences.begin("pid", true);
-    state.Kp = preferences.getDouble("Kp", DEFAULT_KP);
-    state.Ki = preferences.getDouble("Ki", DEFAULT_KI);
-    state.Kd = preferences.getDouble("Kd", DEFAULT_KD);
-    preferences.end();
-
-    DEBUG_PRINTLN(F("PID Parameters Loaded from NVS"));
-    DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
-
-    // Apply the PID parameters to the controller
-    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
-}
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     handleMQTTMessage(topic, payload, length);
@@ -621,7 +539,7 @@ void handleControlFan(const String& payload) {
 void handleControlHeater(const String& payload) {
     int newHeaterPWM = payload.toInt();
     if (newHeaterPWM >= MIN_HEATER_PWM && newHeaterPWM <= MAX_HEATER_PWM) {
-        state.heaterOutput = newHeaterPWM * 255 / 100;  // Convert percentage to 0-255
+        state.heaterOutput = (newHeaterPWM * 255 + 50) / 100;  // Convert percentage to 0-255 with rounding
         DEBUG_PRINTF_P(PSTR("MQTT: Heater PWM set to %d%%\n"), newHeaterPWM);
     }
 }
@@ -649,7 +567,7 @@ void handleControlPID(const String& payload) {
         if (doc["kp"].is<double>()) state.Kp = doc["kp"];
         if (doc["ki"].is<double>()) state.Ki = doc["ki"];
         if (doc["kd"].is<double>()) state.Kd = doc["kd"];
-        beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
+        updatePIDTunings();
         savePIDParameters();
         DEBUG_PRINTF_P(PSTR("MQTT: PID updated Kp=%.2f, Ki=%.2f, Kd=%.2f\n"), state.Kp, state.Ki, state.Kd);
     }
@@ -728,7 +646,7 @@ void handleAutoTuneStop(const String& payload) {
     state.Kp = autoTuneOriginalKp;
     state.Ki = autoTuneOriginalKi;
     state.Kd = autoTuneOriginalKd;
-    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
+    updatePIDTunings();
 
     // Reset state
     autoTuneState = AUTOTUNE_IDLE;
@@ -763,7 +681,7 @@ void handleAutoTuneApply(const String& payload) {
     state.Kd = autoTuneRecommendedKd;
 
     // Update the PID controller
-    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
+    updatePIDTunings();
 
     // Save to NVS for persistence
     savePIDParameters();
