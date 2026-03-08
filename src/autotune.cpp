@@ -434,7 +434,7 @@ static void publishAutoTuneResultsMsg() {
     DEBUG_PRINTF("MQTT: Published auto-tune results (%d bytes)\n", len);
 }
 
-// --- Auto-tune state machine (unchanged Ziegler-Nichols) ---
+// --- Auto-tune state machine ---
 
 void updateAutoTune() {
     // Periodic status publishing for active auto-tune
