@@ -8,7 +8,6 @@ MAX6675Handler::MAX6675Handler(int csPin) : _csPin(csPin) {}
 void MAX6675Handler::begin() {
     pinMode(_csPin, OUTPUT);  // Set CS pin as output
     digitalWrite(_csPin, HIGH); // Deselect MAX6675 by default
-    SPI.begin(); // Initialize SPI
 }
 
 // Read raw data from the MAX6675 module

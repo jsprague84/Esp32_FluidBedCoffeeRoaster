@@ -194,7 +194,8 @@ void setup() {
         Serial.println(F("\nWiFi connection failed!"));
     }
 
-    // Initialize thermocouples
+    // Initialize SPI once, then thermocouples
+    SPI.begin();
     beanThermocouple.begin();
     envThermocouple.begin();
     DEBUG_PRINTLN(F("MAX6675 Initialized"));
