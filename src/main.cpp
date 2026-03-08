@@ -287,8 +287,11 @@ void loop() {
         }
     }
 
-    // Control fan
-    ledcWrite(FAN_PIN, state.fanPWM);
+    // Control fan — only write when value changes
+    if (state.fanPWM != state.prevFanPWM) {
+        ledcWrite(FAN_PIN, state.fanPWM);
+        state.prevFanPWM = state.fanPWM;
+    }
 
     // Heater Control Logic
     if (!state.heaterEnabled) {
@@ -727,6 +730,7 @@ void handleEmergencyStop(const String& payload) {
         DEBUG_PRINTLN(F("MQTT: EMERGENCY STOP RECEIVED!"));
         state.heaterEnabled = false;
         state.fanPWM = 255;
+        state.prevFanPWM = 255;
         state.heaterOutput = 0;
         ledcWrite(SSR_PIN, 0);
         ledcWrite(FAN_PIN, 255);
