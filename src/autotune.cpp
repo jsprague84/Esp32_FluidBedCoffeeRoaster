@@ -62,6 +62,26 @@ static float autoTuneCoolingTime = 0.0f;
 static int autoTuneHeatingCount = 0;
 static int autoTuneCoolingCount = 0;
 
+// Auto-tune mode: "relay" or "step_response"
+static const char* autoTuneMode = "relay";
+
+// Step response data buffer
+typedef struct {
+    unsigned long time_ms;
+    float temperature;
+} StepDataPoint;
+static StepDataPoint autoTuneStepData[AUTOTUNE_STEP_DATA_SIZE];
+static int autoTuneStepDataCount = 0;
+static float autoTuneStepBaselineTemp = 0.0f;
+static float autoTuneStepOutputPct = 0.0f;
+static unsigned long autoTuneStepSettleStart = 0;
+static float autoTuneStepAggressiveness = 1.0f;
+
+// FOPDT model parameters (for step response mode)
+static float autoTuneFOPDT_K = 0.0f;
+static float autoTuneFOPDT_tau = 0.0f;
+static float autoTuneFOPDT_theta = 0.0f;
+
 // Quality metrics for reporting
 static float autoTuneConsistencyPct = 0.0f;
 static float autoTuneAsymmetryRatio = 0.0f;
@@ -95,6 +115,10 @@ const char* getAutoTuneStateString(AutoTuneState atState) {
         case AUTOTUNE_ANALYZING: return "analyzing";
         case AUTOTUNE_COMPLETE: return "complete";
         case AUTOTUNE_FAILED: return "failed";
+        case AUTOTUNE_STEP_BASELINE: return "step_baseline";
+        case AUTOTUNE_STEP_UP: return "step_up";
+        case AUTOTUNE_STEP_SETTLE: return "step_settle";
+        case AUTOTUNE_STEP_ANALYZE: return "step_analyze";
         default: return "unknown";
     }
 }
@@ -124,6 +148,20 @@ void handleAutoTuneStart(const char* payload, size_t len) {
     if (autoTuneState != AUTOTUNE_IDLE) {
         DEBUG_PRINTLN(F("Auto-tune already running"));
         return;
+    }
+
+    // Parse optional mode: 'relay' (default) or 'step_response'
+    const char* modeStr = doc["mode"] | "relay";
+    const char* selectedMode = "relay";
+    if (strcmp(modeStr, "step_response") == 0) {
+        selectedMode = "step_response";
+    }
+
+    // Parse optional aggressiveness for SIMC (step response mode)
+    float aggressiveness = doc["aggressiveness"] | 1.0f;
+    if (aggressiveness < 0.1f || aggressiveness > 2.0f) {
+        DEBUG_PRINTF("Auto-tune: invalid aggressiveness %.2f, using default 1.0\n", aggressiveness);
+        aggressiveness = 1.0f;
     }
 
     // Parse optional tuning method (store to local, assign after reset)
@@ -168,12 +206,11 @@ void handleAutoTuneStart(const char* payload, size_t len) {
         amplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
     }
 
-    DEBUG_PRINTF("Starting auto-tune: target=%.1f°C, method=%s, bias=%.0f%%, amp=%.0f%%, hyst=%.1f°C\n",
-                 targetTemp, selectedMethod, bias, amplitude, hysteresis);
+    DEBUG_PRINTF("Starting auto-tune: target=%.1f°C, mode=%s, method=%s, bias=%.0f%%, amp=%.0f%%, hyst=%.1f°C\n",
+                 targetTemp, selectedMode, selectedMethod, bias, amplitude, hysteresis);
 
     autoTuneTargetTemp = targetTemp;
     autoTuneSetpoint = targetTemp;
-    autoTuneState = AUTOTUNE_HEATING;
     autoTuneStartTime = millis();
     autoTuneStepStartTime = millis();
     autoTuneCurrentStep = 0;
@@ -192,11 +229,22 @@ void handleAutoTuneStart(const char* payload, size_t len) {
     autoTuneOutputAmplitude = amplitude;
     autoTuneRelayHyst = hysteresis;
     autoTuneTuningMethod = selectedMethod;
+    autoTuneMode = selectedMode;
+    autoTuneStepAggressiveness = aggressiveness;
 
     state.controlMode = MODE_MANUAL;
     state.beanSetpoint = autoTuneTargetTemp;
-    state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
     state.heaterEnabled = true;
+
+    // Route to correct initial state based on mode
+    if (strcmp(autoTuneMode, "step_response") == 0) {
+        autoTuneState = AUTOTUNE_STEP_BASELINE;
+        state.heaterOutput = autoTuneOutputBias * 255 / 100;
+        DEBUG_PRINTLN(F("Auto-tune starting step response mode: STEP_BASELINE"));
+    } else {
+        autoTuneState = AUTOTUNE_HEATING;
+        state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
+    }
 
     publishAutoTuneStatusMsg();
 }
@@ -262,14 +310,24 @@ static void publishAutoTuneStatusMsg() {
     doc["state"] = getAutoTuneStateString(autoTuneState);
     doc["message"] = getAutoTuneStateString(autoTuneState);
 
+    doc["mode"] = autoTuneMode;
+    doc["tuning_method"] = autoTuneTuningMethod;
+
     if (autoTuneState == AUTOTUNE_RUNNING || autoTuneState == AUTOTUNE_ANALYZING) {
         float progress = ((float)autoTuneCurrentStep / AUTOTUNE_TOTAL_STEPS) * 100.0;
-        if (autoTuneState == AUTOTUNE_ANALYZING) {
-            progress = 90.0;
-        }
+        if (autoTuneState == AUTOTUNE_ANALYZING) progress = 90.0f;
         doc["progress"] = progress;
         doc["current_step"] = autoTuneCurrentStep;
         doc["total_steps"] = AUTOTUNE_TOTAL_STEPS;
+    } else if (autoTuneState == AUTOTUNE_STEP_BASELINE) {
+        float elapsed = (millis() - autoTuneStepStartTime) / (float)AUTOTUNE_STEP_BASELINE_TIME;
+        doc["progress"] = elapsed * 25.0f;
+    } else if (autoTuneState == AUTOTUNE_STEP_UP) {
+        doc["progress"] = 25.0f + 50.0f * (autoTuneStepDataCount / (float)AUTOTUNE_STEP_DATA_SIZE);
+    } else if (autoTuneState == AUTOTUNE_STEP_SETTLE) {
+        doc["progress"] = 80.0f;
+    } else if (autoTuneState == AUTOTUNE_STEP_ANALYZE) {
+        doc["progress"] = 90.0f;
     } else {
         doc["progress"] = 0;
         doc["current_step"] = nullptr;
@@ -332,7 +390,9 @@ void updateAutoTune() {
     }
 
     if (autoTuneState != AUTOTUNE_RUNNING && autoTuneState != AUTOTUNE_ANALYZING &&
-        autoTuneState != AUTOTUNE_HEATING && autoTuneState != AUTOTUNE_STABILIZING) {
+        autoTuneState != AUTOTUNE_HEATING && autoTuneState != AUTOTUNE_STABILIZING &&
+        autoTuneState != AUTOTUNE_STEP_BASELINE && autoTuneState != AUTOTUNE_STEP_UP &&
+        autoTuneState != AUTOTUNE_STEP_SETTLE && autoTuneState != AUTOTUNE_STEP_ANALYZE) {
         return;
     }
 
@@ -538,6 +598,82 @@ void updateAutoTune() {
         state.controlMode = MODE_AUTO;
         publishAutoTuneStatusMsg();
     }
+    // --- Step response state machine ---
+    else if (autoTuneState == AUTOTUNE_STEP_BASELINE) {
+        // Run heater at bias output, measure baseline temperature
+        state.heaterOutput = autoTuneOutputBias * 255 / 100;
+        if (state.heaterOutput > 255) state.heaterOutput = 255;
+
+        if (now - autoTuneStepStartTime >= AUTOTUNE_STEP_BASELINE_TIME) {
+            autoTuneStepBaselineTemp = autoTuneFilteredTemp;
+            autoTuneStepOutputPct = autoTuneOutputBias;
+            autoTuneStepDataCount = 0;
+            autoTuneStepStartTime = now;
+            autoTuneState = AUTOTUNE_STEP_UP;
+            DEBUG_PRINTF("Auto-tune STEP_BASELINE complete: baseline=%.1f°C, stepping up to %.0f%%\n",
+                         autoTuneStepBaselineTemp, autoTuneOutputBias + autoTuneOutputAmplitude);
+        }
+    }
+    else if (autoTuneState == AUTOTUNE_STEP_UP) {
+        // Increase heater output, record data every ~1 second
+        float stepOutput = autoTuneOutputBias + autoTuneOutputAmplitude;
+        state.heaterOutput = stepOutput * 255 / 100;
+        if (state.heaterOutput > 255) state.heaterOutput = 255;
+
+        // Record data point (~1Hz, same rate as temp reads)
+        if (autoTuneStepDataCount < AUTOTUNE_STEP_DATA_SIZE) {
+            autoTuneStepData[autoTuneStepDataCount].time_ms = now - autoTuneStepStartTime;
+            autoTuneStepData[autoTuneStepDataCount].temperature = autoTuneFilteredTemp;
+            autoTuneStepDataCount++;
+        }
+
+        // Check if temperature has settled (RoR low enough)
+        float absRor = fabs(getRateOfRise());
+        if (absRor < AUTOTUNE_STEP_SETTLE_ROR) {
+            if (autoTuneStepSettleStart == 0) autoTuneStepSettleStart = now;
+        } else {
+            autoTuneStepSettleStart = 0;
+        }
+
+        // Transition to SETTLE if RoR has been low enough, or buffer is filling up
+        if ((autoTuneStepSettleStart != 0 && (now - autoTuneStepSettleStart) >= AUTOTUNE_STEP_SETTLE_TIME) ||
+            autoTuneStepDataCount >= AUTOTUNE_STEP_DATA_SIZE - 10) {
+            autoTuneState = AUTOTUNE_STEP_SETTLE;
+            autoTuneStepSettleStart = 0;
+            DEBUG_PRINTF("Auto-tune STEP_UP → STEP_SETTLE: %d data points, temp=%.1f°C\n",
+                         autoTuneStepDataCount, autoTuneFilteredTemp);
+        }
+    }
+    else if (autoTuneState == AUTOTUNE_STEP_SETTLE) {
+        // Continue recording, wait for full settling
+        float stepOutput = autoTuneOutputBias + autoTuneOutputAmplitude;
+        state.heaterOutput = stepOutput * 255 / 100;
+        if (state.heaterOutput > 255) state.heaterOutput = 255;
+
+        if (autoTuneStepDataCount < AUTOTUNE_STEP_DATA_SIZE) {
+            autoTuneStepData[autoTuneStepDataCount].time_ms = now - autoTuneStepStartTime;
+            autoTuneStepData[autoTuneStepDataCount].temperature = autoTuneFilteredTemp;
+            autoTuneStepDataCount++;
+        }
+
+        float absRor = fabs(getRateOfRise());
+        if (absRor < AUTOTUNE_STEP_SETTLE_ROR) {
+            if (autoTuneStepSettleStart == 0) autoTuneStepSettleStart = now;
+        } else {
+            autoTuneStepSettleStart = 0;
+        }
+
+        if ((autoTuneStepSettleStart != 0 && (now - autoTuneStepSettleStart) >= AUTOTUNE_STEP_SETTLE_TIME) ||
+            autoTuneStepDataCount >= AUTOTUNE_STEP_DATA_SIZE) {
+            autoTuneState = AUTOTUNE_STEP_ANALYZE;
+            DEBUG_PRINTF("Auto-tune STEP_SETTLE → STEP_ANALYZE: %d data points\n", autoTuneStepDataCount);
+        }
+    }
+    else if (autoTuneState == AUTOTUNE_STEP_ANALYZE) {
+        // Placeholder: actual FOPDT computation implemented in US-009
+        autoTuneState = AUTOTUNE_ANALYZING;
+        DEBUG_PRINTLN(F("Auto-tune STEP_ANALYZE → ANALYZING (FOPDT computation)"));
+    }
 }
 
 static bool calculateAutoTunePIDParameters() {
@@ -738,4 +874,13 @@ static void resetAutoTuneData() {
     autoTuneOutputBias = AUTOTUNE_OUTPUT_BIAS;
     autoTuneOutputAmplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
     autoTuneRelayHyst = AUTOTUNE_RELAY_HYST;
+    autoTuneMode = "relay";
+    autoTuneStepDataCount = 0;
+    autoTuneStepBaselineTemp = 0.0f;
+    autoTuneStepOutputPct = 0.0f;
+    autoTuneStepSettleStart = 0;
+    autoTuneStepAggressiveness = 1.0f;
+    autoTuneFOPDT_K = 0.0f;
+    autoTuneFOPDT_tau = 0.0f;
+    autoTuneFOPDT_theta = 0.0f;
 }

@@ -8,7 +8,12 @@ typedef enum {
     AUTOTUNE_RUNNING = 3,
     AUTOTUNE_ANALYZING = 4,
     AUTOTUNE_COMPLETE = 5,
-    AUTOTUNE_FAILED = 6
+    AUTOTUNE_FAILED = 6,
+    // Step response states
+    AUTOTUNE_STEP_BASELINE = 7,
+    AUTOTUNE_STEP_UP = 8,
+    AUTOTUNE_STEP_SETTLE = 9,
+    AUTOTUNE_STEP_ANALYZE = 10
 } AutoTuneState;
 
 void initAutoTune();

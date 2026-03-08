@@ -109,5 +109,10 @@ extern const char* password;
 #define AUTOTUNE_EMA_ALPHA 0.3f
 // Temperature history buffer size (samples at ~1Hz)
 #define AUTOTUNE_TEMP_HISTORY_SIZE 120
+// Step response auto-tune configuration
+#define AUTOTUNE_STEP_BASELINE_TIME 60000
+#define AUTOTUNE_STEP_SETTLE_ROR 0.5f
+#define AUTOTUNE_STEP_SETTLE_TIME 30000
+#define AUTOTUNE_STEP_DATA_SIZE 300
 
 #endif
