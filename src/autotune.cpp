@@ -24,6 +24,7 @@ static unsigned long autoTuneStabilizationStartTime = 0;
 static int autoTuneCurrentStep = 0;
 static float autoTuneOutputBias = AUTOTUNE_OUTPUT_BIAS;
 static float autoTuneOutputAmplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
+static float autoTuneRelayHyst = AUTOTUNE_RELAY_HYST;
 static double autoTuneOriginalKp = 0.0, autoTuneOriginalKi = 0.0, autoTuneOriginalKd = 0.0;
 static double autoTuneRecommendedKp = 0.0, autoTuneRecommendedKi = 0.0, autoTuneRecommendedKd = 0.0;
 static bool autoTuneUsedFallback = false;
@@ -125,21 +126,50 @@ void handleAutoTuneStart(const char* payload, size_t len) {
         return;
     }
 
-    // Parse optional tuning method (assign to static string literals for safety)
+    // Parse optional tuning method (store to local, assign after reset)
     const char* method = doc["tuning_method"] | "tyreus_luyben";
+    const char* selectedMethod = "tyreus_luyben";
     if (strcmp(method, "zn_classic") == 0) {
-        autoTuneTuningMethod = "zn_classic";
+        selectedMethod = "zn_classic";
     } else if (strcmp(method, "zn_some_overshoot") == 0) {
-        autoTuneTuningMethod = "zn_some_overshoot";
+        selectedMethod = "zn_some_overshoot";
     } else if (strcmp(method, "zn_no_overshoot") == 0) {
-        autoTuneTuningMethod = "zn_no_overshoot";
+        selectedMethod = "zn_no_overshoot";
     } else if (strcmp(method, "tyreus_luyben") == 0) {
-        autoTuneTuningMethod = "tyreus_luyben";
+        selectedMethod = "tyreus_luyben";
     } else {
-        autoTuneTuningMethod = "tyreus_luyben";
         DEBUG_PRINTF("Auto-tune: unrecognized tuning_method '%s', defaulting to tyreus_luyben\n", method);
     }
-    DEBUG_PRINTF("Starting auto-tune: target=%.1f°C, tuning_method=%s\n", targetTemp, autoTuneTuningMethod);
+    // Parse optional relay parameters with validation
+    float bias = doc["bias"] | (float)AUTOTUNE_OUTPUT_BIAS;
+    float amplitude = doc["amplitude"] | (float)AUTOTUNE_OUTPUT_AMPLITUDE;
+    float hysteresis = doc["hysteresis"] | (float)AUTOTUNE_RELAY_HYST;
+
+    if (bias < 10.0f || bias > 90.0f) {
+        DEBUG_PRINTF("Auto-tune: invalid bias %.1f, using default %d\n", bias, AUTOTUNE_OUTPUT_BIAS);
+        bias = AUTOTUNE_OUTPUT_BIAS;
+    }
+    if (amplitude < 5.0f || amplitude > 45.0f) {
+        DEBUG_PRINTF("Auto-tune: invalid amplitude %.1f, using default %d\n", amplitude, AUTOTUNE_OUTPUT_AMPLITUDE);
+        amplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
+    }
+    if (hysteresis < 0.1f || hysteresis > 5.0f) {
+        DEBUG_PRINTF("Auto-tune: invalid hysteresis %.1f, using default %.1f\n", hysteresis, (float)AUTOTUNE_RELAY_HYST);
+        hysteresis = AUTOTUNE_RELAY_HYST;
+    }
+    if (bias + amplitude > 100.0f) {
+        DEBUG_PRINTF("Auto-tune: bias+amplitude > 100 (%.1f+%.1f), using defaults\n", bias, amplitude);
+        bias = AUTOTUNE_OUTPUT_BIAS;
+        amplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
+    }
+    if (bias - amplitude < 0.0f) {
+        DEBUG_PRINTF("Auto-tune: bias-amplitude < 0 (%.1f-%.1f), using defaults\n", bias, amplitude);
+        bias = AUTOTUNE_OUTPUT_BIAS;
+        amplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
+    }
+
+    DEBUG_PRINTF("Starting auto-tune: target=%.1f°C, method=%s, bias=%.0f%%, amp=%.0f%%, hyst=%.1f°C\n",
+                 targetTemp, selectedMethod, bias, amplitude, hysteresis);
 
     autoTuneTargetTemp = targetTemp;
     autoTuneSetpoint = targetTemp;
@@ -156,6 +186,12 @@ void handleAutoTuneStart(const char* payload, size_t len) {
     autoTuneOriginalKd = state.Kd;
 
     resetAutoTuneData();
+
+    // Set configurable params after reset (reset restores defaults)
+    autoTuneOutputBias = bias;
+    autoTuneOutputAmplitude = amplitude;
+    autoTuneRelayHyst = hysteresis;
+    autoTuneTuningMethod = selectedMethod;
 
     state.controlMode = MODE_MANUAL;
     state.beanSetpoint = autoTuneTargetTemp;
@@ -440,7 +476,7 @@ void updateAutoTune() {
         bool toggled = false;
         float stepDurationSec = stepDuration / 1000.0f;
         if (autoTuneOutputHigh) {
-            if (error >= AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
+            if (error >= autoTuneRelayHyst || stepDuration >= stepTimeout) {
                 // Record actual peak (running max), not crossing temperature
                 if (autoTunePeakCount < 10) {
                     autoTunePeaks[autoTunePeakCount].temperature = autoTuneRunningMax;
@@ -456,7 +492,7 @@ void updateAutoTune() {
                 state.heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
             }
         } else {
-            if (error <= -AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
+            if (error <= -autoTuneRelayHyst || stepDuration >= stepTimeout) {
                 // Record actual valley (running min), not crossing temperature
                 if (autoTuneValleyCount < 10) {
                     autoTuneValleys[autoTuneValleyCount].temperature = autoTuneRunningMin;
@@ -632,7 +668,7 @@ static bool calculateAutoTunePIDParameters() {
 
     // Hysteresis correction: compensate for relay hysteresis phase shift
     autoTuneHysteresisCorrection = 1.0f;
-    float hyst = AUTOTUNE_RELAY_HYST;
+    float hyst = autoTuneRelayHyst;
     if (avgAmplitude > hyst) {
         float ratio = hyst / avgAmplitude;
         autoTuneHysteresisCorrection = 1.0f / sqrtf(1.0f - ratio * ratio);
@@ -699,4 +735,7 @@ static void resetAutoTuneData() {
     autoTuneAsymmetryRatio = 0.0f;
     autoTuneHysteresisCorrection = 0.0f;
     autoTuneTuningMethod = "tyreus_luyben";
+    autoTuneOutputBias = AUTOTUNE_OUTPUT_BIAS;
+    autoTuneOutputAmplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
+    autoTuneRelayHyst = AUTOTUNE_RELAY_HYST;
 }
