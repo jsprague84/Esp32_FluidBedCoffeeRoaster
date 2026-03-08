@@ -670,9 +670,105 @@ void updateAutoTune() {
         }
     }
     else if (autoTuneState == AUTOTUNE_STEP_ANALYZE) {
-        // Placeholder: actual FOPDT computation implemented in US-009
-        autoTuneState = AUTOTUNE_ANALYZING;
-        DEBUG_PRINTLN(F("Auto-tune STEP_ANALYZE → ANALYZING (FOPDT computation)"));
+        // FOPDT model identification from step response data
+        if (autoTuneStepDataCount < 10) {
+            DEBUG_PRINTLN(F("Auto-tune STEP_ANALYZE: insufficient data points"));
+            autoTuneState = AUTOTUNE_FAILED;
+            publishAutoTuneStatusMsg();
+            handleAutoTuneStop("", 0);
+            return;
+        }
+
+        // Final temperature: average of last 10 data points (steady-state estimate)
+        float finalTemp = 0.0f;
+        int lastN = (autoTuneStepDataCount >= 10) ? 10 : autoTuneStepDataCount;
+        for (int i = autoTuneStepDataCount - lastN; i < autoTuneStepDataCount; i++) {
+            finalTemp += autoTuneStepData[i].temperature;
+        }
+        finalTemp /= lastN;
+
+        // Process gain K = (final_temp - baseline_temp) / (step_output - baseline_output)
+        float stepOutputPct = autoTuneOutputBias + autoTuneOutputAmplitude;
+        float baselineOutputPct = autoTuneOutputBias;
+        float deltaOutput = stepOutputPct - baselineOutputPct;
+        float deltaTemp = finalTemp - autoTuneStepBaselineTemp;
+
+        if (deltaOutput <= 0 || deltaTemp <= 0) {
+            DEBUG_PRINTF("Auto-tune STEP_ANALYZE: invalid gain (deltaTemp=%.2f, deltaOutput=%.1f)\n", deltaTemp, deltaOutput);
+            autoTuneState = AUTOTUNE_FAILED;
+            publishAutoTuneStatusMsg();
+            handleAutoTuneStop("", 0);
+            return;
+        }
+
+        float K = deltaTemp / deltaOutput;
+
+        // Dead time θ: first point where temp exceeds baseline + noise threshold
+        float noiseThreshold = 3.0f * AUTOTUNE_EMA_ALPHA;
+        float theta = 0.0f;
+        for (int i = 0; i < autoTuneStepDataCount; i++) {
+            if (autoTuneStepData[i].temperature > autoTuneStepBaselineTemp + noiseThreshold) {
+                theta = autoTuneStepData[i].time_ms / 1000.0f;
+                break;
+            }
+        }
+
+        // Time constant τ: point where temp reaches baseline + 0.632 * (final - baseline)
+        float target632 = autoTuneStepBaselineTemp + 0.632f * deltaTemp;
+        float tau = 0.0f;
+        for (int i = 0; i < autoTuneStepDataCount; i++) {
+            if (autoTuneStepData[i].temperature >= target632) {
+                tau = autoTuneStepData[i].time_ms / 1000.0f - theta;
+                break;
+            }
+        }
+
+        // Validate model parameters
+        if (K <= 0 || tau <= 1.0f || theta < 0) {
+            DEBUG_PRINTF("Auto-tune STEP_ANALYZE: invalid FOPDT model (K=%.3f, tau=%.1f, theta=%.1f)\n", K, tau, theta);
+            autoTuneState = AUTOTUNE_FAILED;
+            publishAutoTuneStatusMsg();
+            handleAutoTuneStop("", 0);
+            return;
+        }
+
+        // Store FOPDT parameters
+        autoTuneFOPDT_K = K;
+        autoTuneFOPDT_tau = tau;
+        autoTuneFOPDT_theta = theta;
+
+        DEBUG_PRINTF("Auto-tune FOPDT: K=%.3f °C/%%, tau=%.1fs, theta=%.1fs\n", K, tau, theta);
+        DEBUG_PRINTF("Auto-tune step response: baseline=%.1f°C, final=%.1f°C, delta=%.1f°C\n",
+                     autoTuneStepBaselineTemp, finalTemp, deltaTemp);
+
+        // SIMC PID tuning: τc = aggressiveness * θ
+        float tau_c = autoTuneStepAggressiveness * theta;
+        float Kp = (1.0f / K) * tau / (tau_c + theta);
+        float Ti = fminf(tau, 4.0f * (tau_c + theta));
+        float Td = 0.5f * theta;
+        float Ki = Kp / Ti;
+        float Kd = Kp * Td;
+
+        DEBUG_PRINTF("Auto-tune SIMC: tau_c=%.1fs, Kp=%.3f, Ki=%.4f, Kd=%.3f\n", tau_c, Kp, Ki, Kd);
+
+        // Clamp PID gains
+        if (Kp > 50) Kp = 50;
+        if (Kp < 0.5f) Kp = 0.5f;
+        if (Ki > 5) Ki = 5;
+        if (Ki < 0.05f) Ki = 0.05f;
+        if (Kd > 100) Kd = 100;
+        if (Kd < 0.5f) Kd = 0.5f;
+
+        autoTuneRecommendedKp = Kp;
+        autoTuneRecommendedKi = Ki;
+        autoTuneRecommendedKd = Kd;
+
+        autoTuneState = AUTOTUNE_COMPLETE;
+        DEBUG_PRINTF("Auto-tune step response complete: Kp=%.2f, Ki=%.4f, Kd=%.2f\n", Kp, Ki, Kd);
+        publishAutoTuneResultsMsg();
+        state.heaterEnabled = false;
+        state.controlMode = MODE_AUTO;
+        publishAutoTuneStatusMsg();
     }
 }
 
