@@ -52,8 +52,16 @@ static unsigned long autoTuneTempTimeHistory[AUTOTUNE_TEMP_HISTORY_SIZE];
 static int autoTuneTempHistoryIndex = 0;
 static int autoTuneTempHistoryCount = 0;
 
+// Heating/cooling half-period tracking for asymmetry correction
+static float autoTuneHeatingTime = 0.0f;
+static float autoTuneCoolingTime = 0.0f;
+static int autoTuneHeatingCount = 0;
+static int autoTuneCoolingCount = 0;
+
 // Quality metrics for reporting
 static float autoTuneConsistencyPct = 0.0f;
+static float autoTuneAsymmetryRatio = 0.0f;
+static float autoTuneHysteresisCorrection = 0.0f;
 
 // Status publishing interval
 static unsigned long lastAutoTuneStatusPublish = 0;
@@ -413,6 +421,7 @@ void updateAutoTune() {
         }
 
         bool toggled = false;
+        float stepDurationSec = stepDuration / 1000.0f;
         if (autoTuneOutputHigh) {
             if (error >= AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
                 // Record actual peak (running max), not crossing temperature
@@ -422,6 +431,9 @@ void updateAutoTune() {
                     autoTunePeakCount++;
                 }
                 autoTuneRunningMax = -1e9f;  // Reset for next cycle
+                // Track heating half-period (output was high during this step)
+                autoTuneHeatingTime += stepDurationSec;
+                autoTuneHeatingCount++;
                 autoTuneOutputHigh = false;
                 toggled = true;
                 state.heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
@@ -435,6 +447,9 @@ void updateAutoTune() {
                     autoTuneValleyCount++;
                 }
                 autoTuneRunningMin = 1e9f;  // Reset for next cycle
+                // Track cooling half-period (output was low during this step)
+                autoTuneCoolingTime += stepDurationSec;
+                autoTuneCoolingCount++;
                 autoTuneOutputHigh = true;
                 toggled = true;
                 state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
@@ -579,8 +594,42 @@ static bool calculateAutoTunePIDParameters() {
 
     float outputSwing = autoTuneOutputAmplitude * 2;
     float Ku = (outputSwing * 4) / (avgAmplitude * 3.14159f);
+    float rawKu = Ku;
 
-    // Ziegler-Nichols PID rules
+    // Asymmetry correction: account for different heating/cooling dynamics
+    autoTuneAsymmetryRatio = 0.0f;
+    if (autoTuneHeatingCount > 0 && autoTuneCoolingCount > 0) {
+        float avgHeatingHalf = autoTuneHeatingTime / autoTuneHeatingCount;
+        float avgCoolingHalf = autoTuneCoolingTime / autoTuneCoolingCount;
+        autoTuneAsymmetryRatio = avgHeatingHalf / avgCoolingHalf;
+
+        float d_h = autoTuneOutputBias + autoTuneOutputAmplitude;
+        float d_c = autoTuneOutputBias - autoTuneOutputAmplitude;
+        float d = (float)autoTuneOutputAmplitude;
+        if (d_c > 0 && avgAmplitude > 0) {
+            Ku = (4.0f * d) / (3.14159f * avgAmplitude) * sqrtf(1.0f + (d_h / d_c) * (d_h / d_c)) / sqrtf(2.0f);
+        }
+        DEBUG_PRINTF("Auto-tune asymmetry: ratio=%.2f, heating_half=%.1fs, cooling_half=%.1fs\n",
+                     autoTuneAsymmetryRatio, avgHeatingHalf, avgCoolingHalf);
+    }
+
+    // Hysteresis correction: compensate for relay hysteresis phase shift
+    autoTuneHysteresisCorrection = 1.0f;
+    float hyst = AUTOTUNE_RELAY_HYST;
+    if (avgAmplitude > hyst) {
+        float ratio = hyst / avgAmplitude;
+        autoTuneHysteresisCorrection = 1.0f / sqrtf(1.0f - ratio * ratio);
+        Ku *= autoTuneHysteresisCorrection;
+        DEBUG_PRINTF("Auto-tune hysteresis correction: factor=%.3f\n", autoTuneHysteresisCorrection);
+    } else {
+        DEBUG_PRINTLN(F("Auto-tune: amplitude <= hysteresis, skipping hysteresis correction"));
+    }
+
+    DEBUG_PRINTF("Auto-tune Ku: raw=%.2f, asymmetry_factor=%.3f, hyst_factor=%.3f, corrected=%.2f\n",
+                 rawKu, (autoTuneAsymmetryRatio > 0) ? Ku / (rawKu * autoTuneHysteresisCorrection) : 1.0f,
+                 autoTuneHysteresisCorrection, Ku);
+
+    // Ziegler-Nichols PID rules (will be replaced by tuning method selection in US-006)
     autoTuneRecommendedKp = 0.6f * Ku;
     autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
     autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 8.0f;
@@ -609,5 +658,11 @@ static void resetAutoTuneData() {
     autoTuneFilterInitialized = false;
     autoTuneRunningMax = -1e9f;
     autoTuneRunningMin = 1e9f;
+    autoTuneHeatingTime = 0.0f;
+    autoTuneCoolingTime = 0.0f;
+    autoTuneHeatingCount = 0;
+    autoTuneCoolingCount = 0;
     autoTuneConsistencyPct = 0.0f;
+    autoTuneAsymmetryRatio = 0.0f;
+    autoTuneHysteresisCorrection = 0.0f;
 }
