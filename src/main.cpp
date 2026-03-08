@@ -407,14 +407,14 @@ void connectMQTT() {
         }
 
         // Publish "online" status
-        StaticJsonDocument<200> doc;
+        JsonDocument doc;
         doc["status"] = "online";
         doc["id"] = clientId;
         doc["ip"] = WiFi.localIP().toString();
         doc["rssi"] = WiFi.RSSI();
-        String statusMsg;
-        serializeJson(doc, statusMsg);
-        mqttClient.publish(MQTT_STATUS_TOPIC, statusMsg.c_str(), true);
+        char statusBuf[200];
+        serializeJson(doc, statusBuf, sizeof(statusBuf));
+        mqttClient.publish(MQTT_STATUS_TOPIC, statusBuf, true);
     } else {
         int mqttState = mqttClient.state();
         DEBUG_PRINTF(" failed, rc=%d\n", mqttState);
@@ -485,7 +485,7 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 void publishMQTTTelemetry() {
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
 
     doc["timestamp"] = millis();
     doc["beanTemp"] = round(state.beanTemperature * 10) / 10.0;
@@ -504,15 +504,19 @@ void publishMQTTTelemetry() {
     doc["rssi"] = WiFi.RSSI();
     doc["systemStatus"] = state.systemStatus;
 
-    String payload;
-    serializeJson(doc, payload);
+    if (doc.overflowed()) {
+        DEBUG_PRINTLN(F("WARNING: Telemetry JSON document overflowed"));
+    }
 
-    mqttClient.publish(MQTT_TELEMETRY_TOPIC, payload.c_str());
-    DEBUG_PRINTF("MQTT: Published telemetry (%d bytes)\n", payload.length());
+    static char telemetryBuf[512];
+    size_t len = serializeJson(doc, telemetryBuf, sizeof(telemetryBuf));
+
+    mqttClient.publish(MQTT_TELEMETRY_TOPIC, telemetryBuf);
+    DEBUG_PRINTF("MQTT: Published telemetry (%d bytes)\n", len);
 }
 
 void publishMQTTStatus(const String& status) {
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     doc["status"] = status;
     doc["timestamp"] = millis();
     doc["ip"] = WiFi.localIP().toString();
@@ -520,10 +524,10 @@ void publishMQTTStatus(const String& status) {
     doc["freeHeap"] = ESP.getFreeHeap();
     doc["version"] = "2.0.0-mqtt-only";
 
-    String payload;
-    serializeJson(doc, payload);
+    static char statusBuf[256];
+    serializeJson(doc, statusBuf, sizeof(statusBuf));
 
-    mqttClient.publish(MQTT_STATUS_TOPIC, payload.c_str(), true);
+    mqttClient.publish(MQTT_STATUS_TOPIC, statusBuf, true);
 }
 
 void updateRateOfRise(float currentTemp) {
@@ -691,12 +695,12 @@ void handleControlEnable(const String& payload) {
 
 void handleControlPID(const String& payload) {
     // Expect JSON: {"kp": 15.0, "ki": 1.0, "kd": 25.0}
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
     if (!error) {
-        if (doc.containsKey("kp")) state.Kp = doc["kp"];
-        if (doc.containsKey("ki")) state.Ki = doc["ki"];
-        if (doc.containsKey("kd")) state.Kd = doc["kd"];
+        if (doc["kp"].is<double>()) state.Kp = doc["kp"];
+        if (doc["ki"].is<double>()) state.Ki = doc["ki"];
+        if (doc["kd"].is<double>()) state.Kd = doc["kd"];
         beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
         savePIDParameters();
         DEBUG_PRINTF_P(PSTR("MQTT: PID updated Kp=%.2f, Ki=%.2f, Kd=%.2f\n"), state.Kp, state.Ki, state.Kd);
@@ -718,7 +722,7 @@ void handleEmergencyStop(const String& payload) {
 // Auto-tune function implementations
 void handleAutoTuneStart(const String& payload) {
     // Parse JSON payload for target temperature
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
 
     if (error) {
@@ -1055,7 +1059,7 @@ void updateAutoTune() {
 void publishAutoTuneStatus() {
     if (!mqttClient.connected()) return;
 
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
 
     doc["state"] = getAutoTuneStateString(autoTuneState);
     doc["message"] = getAutoTuneStateString(autoTuneState);
@@ -1088,17 +1092,17 @@ void publishAutoTuneStatus() {
 
     doc["timestamp"] = millis();
 
-    String payload;
-    serializeJson(doc, payload);
+    static char atStatusBuf[512];
+    size_t len = serializeJson(doc, atStatusBuf, sizeof(atStatusBuf));
 
-    mqttClient.publish(MQTT_AUTOTUNE_STATUS_TOPIC, payload.c_str(), true);  // Retained message
-    DEBUG_PRINTF("MQTT: Published auto-tune status (%d bytes)\n", payload.length());
+    mqttClient.publish(MQTT_AUTOTUNE_STATUS_TOPIC, atStatusBuf, true);  // Retained message
+    DEBUG_PRINTF("MQTT: Published auto-tune status (%d bytes)\n", len);
 }
 
 void publishAutoTuneResults() {
     if (!mqttClient.connected()) return;
 
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
 
     doc["state"] = "complete";
     doc["recommended_kp"] = autoTuneRecommendedKp;
@@ -1114,11 +1118,11 @@ void publishAutoTuneResults() {
     doc["timestamp"] = millis();
     doc["duration"] = (millis() - autoTuneStartTime) / 1000; // Duration in seconds
 
-    String payload;
-    serializeJson(doc, payload);
+    static char atResultsBuf[512];
+    size_t len = serializeJson(doc, atResultsBuf, sizeof(atResultsBuf));
 
-    mqttClient.publish(MQTT_AUTOTUNE_RESULTS_TOPIC, payload.c_str(), true);  // Retained message
-    DEBUG_PRINTF("MQTT: Published auto-tune results (%d bytes)\n", payload.length());
+    mqttClient.publish(MQTT_AUTOTUNE_RESULTS_TOPIC, atResultsBuf, true);  // Retained message
+    DEBUG_PRINTF("MQTT: Published auto-tune results (%d bytes)\n", len);
 }
 
 bool checkAutoTuneCrossedSetpoint() {
