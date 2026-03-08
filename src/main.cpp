@@ -14,6 +14,7 @@
 #include "roaster_state.h"
 #include "temperature.h"
 #include "heater_control.h"
+#include "safety.h"
 
 // WiFi credentials (declared extern in config.h)
 const char* ssid = "jswifi";
@@ -28,6 +29,9 @@ const unsigned long statusUpdateInterval = 5000;
 // MQTT Client
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+
+// Safety module MQTT status bridge (until US-012 replaces PubSubClient)
+bool safetyMqttConnected = false;
 
 // Timing variables
 unsigned long lastSerialOutput = 0;
@@ -141,6 +145,7 @@ void setup() {
     initStateDefaults();
     initializePins();
     initHeaterControl();
+    initSafety();
 
     // Initialize WiFi
     WiFi.mode(WIFI_STA);
@@ -234,8 +239,14 @@ void loop() {
     }
     mqttClient.loop();
 
+    // Update MQTT status for safety module
+    safetyMqttConnected = mqttClient.connected();
+
     // Read Temperatures
     readTemperatures();
+
+    // Safety checks BEFORE heater control
+    runSafetyChecks();
 
     // Heater and fan control
     updateHeaterControl();
@@ -576,12 +587,7 @@ void handleControlPID(const String& payload) {
 void handleEmergencyStop(const String& payload) {
     if (payload == "1" || payload == "true") {
         DEBUG_PRINTLN(F("MQTT: EMERGENCY STOP RECEIVED!"));
-        state.heaterEnabled = false;
-        state.fanPWM = 255;
-        state.prevFanPWM = 255;
-        state.heaterOutput = 0;
-        ledcWrite(SSR_PIN, 0);
-        ledcWrite(FAN_PIN, 255);
+        triggerSafeShutdown();
     }
 }
 
