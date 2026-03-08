@@ -7,7 +7,7 @@
 #include <ArduinoOTA.h>
 #include <PID_v1.h>
 #include "MAX6675Handler.h"
-#include <EEPROM.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "driver/gpio.h"
@@ -17,10 +17,8 @@
 #include "debug.h"
 #include "roaster_state.h"
 
-// Temporary compatibility defines until later stories migrate these APIs
-#ifndef EEPROM_SIZE
-#define EEPROM_SIZE 512
-#endif
+// Preferences for NVS-based PID storage
+Preferences preferences;
 
 // Hardware Pin Definitions (now in config.h)
 #define BT_CS   BT_CS_PIN
@@ -166,7 +164,6 @@ void setup() {
     DEBUG_PRINTLN(F("Starting Coffee Roaster Control with MQTT..."));
 
     initStateDefaults();
-    EEPROM.begin(EEPROM_SIZE);
     initializePins();
 
     // Initialize LEDC for PWM (Arduino Core 3.x API)
@@ -568,42 +565,23 @@ void updatePIDParameters() {
 }
 
 void savePIDParameters() {
-    EEPROM.put(0, state.Kp);
-    EEPROM.put(8, state.Ki);
-    EEPROM.put(16, state.Kd);
-    EEPROM.commit();
-    DEBUG_PRINTLN(F("PID Parameters Saved to EEPROM"));
+    preferences.begin("pid", false);
+    preferences.putDouble("Kp", state.Kp);
+    preferences.putDouble("Ki", state.Ki);
+    preferences.putDouble("Kd", state.Kd);
+    preferences.end();
+    DEBUG_PRINTLN(F("PID Parameters Saved to NVS"));
 }
 
 void loadPIDParameters() {
-    // Read PID parameters from EEPROM
-    double tempKp, tempKi, tempKd;
-    EEPROM.get(0, tempKp);
-    EEPROM.get(8, tempKi);
-    EEPROM.get(16, tempKd);
+    preferences.begin("pid", true);
+    state.Kp = preferences.getDouble("Kp", DEFAULT_KP);
+    state.Ki = preferences.getDouble("Ki", DEFAULT_KI);
+    state.Kd = preferences.getDouble("Kd", DEFAULT_KD);
+    preferences.end();
 
-    // Validate EEPROM data (check for reasonable PID values)
-    bool validData = true;
-    if (isnan(tempKp) || tempKp <= 0 || tempKp > 1000) validData = false;
-    if (isnan(tempKi) || tempKi < 0 || tempKi > 100) validData = false;
-    if (isnan(tempKd) || tempKd < 0 || tempKd > 1000) validData = false;
-
-    if (validData) {
-        // Use EEPROM values
-        state.Kp = tempKp;
-        state.Ki = tempKi;
-        state.Kd = tempKd;
-        DEBUG_PRINTLN(F("PID Parameters Loaded from EEPROM"));
-        DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
-    } else {
-        // Use default values and save them to EEPROM
-        state.Kp = DEFAULT_KP;
-        state.Ki = DEFAULT_KI;
-        state.Kd = DEFAULT_KD;
-        savePIDParameters();
-        DEBUG_PRINTLN(F("EEPROM invalid - using default PID parameters"));
-        DEBUG_PRINTF("Default PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
-    }
+    DEBUG_PRINTLN(F("PID Parameters Loaded from NVS"));
+    DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
 
     // Apply the PID parameters to the controller
     beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
@@ -835,14 +813,14 @@ void handleAutoTuneApply(const String& payload) {
     // Update the PID controller
     beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
 
-    // Save to EEPROM for persistence
+    // Save to NVS for persistence
     savePIDParameters();
 
     // Reset auto-tune state to idle
     autoTuneState = AUTOTUNE_IDLE;
     state.controlMode = MODE_AUTO;  // Return to auto mode with new PID parameters
 
-    DEBUG_PRINTLN(F("Auto-tune results applied and saved to EEPROM"));
+    DEBUG_PRINTLN(F("Auto-tune results applied and saved to NVS"));
 
     // Publish updated status
     publishAutoTuneStatus();
