@@ -14,39 +14,21 @@
 #include "config.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "debug.h"
+#include "roaster_state.h"
 
-// Debugging Macros
-#define DEBUG true
-#if DEBUG
-  #define DEBUG_PRINT(x) Serial.print(x)
-  #define DEBUG_PRINTLN(x) Serial.println(x)
-  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
-  #define DEBUG_PRINTF_P(fmt, ...) Serial.printf_P(fmt, ##__VA_ARGS__)
-#else
-  #define DEBUG_PRINT(x)
-  #define DEBUG_PRINTLN(x)
-  #define DEBUG_PRINTF(fmt, ...)
-  #define DEBUG_PRINTF_P(fmt, ...)
+// Temporary compatibility defines until later stories migrate these APIs
+#ifndef EEPROM_SIZE
+#define EEPROM_SIZE 512
 #endif
 
 // Hardware Pin Definitions (now in config.h)
 #define BT_CS   BT_CS_PIN
 #define ET_CS   ET_CS_PIN
 
-// Control Modes
-#define MODE_MANUAL 0
-#define MODE_AUTO 1
+// Global roaster state
+RoasterState state = {};
 
-// System Status
-typedef enum {
-    SYSTEM_OK = 0,
-    WIFI_ERROR = 1,
-    MQTT_ERROR = 2,
-    SENSOR_ERROR = 3,
-    SAFETY_ERROR = 4
-} SystemStatus;
-
-SystemStatus systemStatus = SYSTEM_OK;
 unsigned long lastStatusUpdate = 0;
 const unsigned long statusUpdateInterval = 5000;
 
@@ -54,18 +36,8 @@ const unsigned long statusUpdateInterval = 5000;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Control Variables
-double beanSetpoint = 0.0;
-double beanTemperature = 0.0;
-double heaterOutput = 0.0;
-double Kp = DEFAULT_KP, Ki = DEFAULT_KI, Kd = DEFAULT_KD;
-float beanTempOffset = TEMP_CALIBRATION_BEAN;
-float envTempOffset = TEMP_CALIBRATION_ENV;
-PID beanPID(&beanTemperature, &heaterOutput, &beanSetpoint, Kp, Ki, Kd, DIRECT);
-float envTemperature = 0.0;
-int fanPWM = 0;
-int controlMode = MODE_MANUAL;
-bool heaterEnabled = false;
+// PID controller uses pointers into state struct
+PID beanPID(&state.beanTemperature, &state.heaterOutput, &state.beanSetpoint, DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, DIRECT);
 
 // Timing variables
 unsigned long lastTempRead = 0;
@@ -84,7 +56,7 @@ int historyCount = 0;
 typedef enum {
     AUTOTUNE_IDLE = 0,
     AUTOTUNE_HEATING = 1,        // Heating to target temperature
-    AUTOTUNE_STABILIZING = 2,    // Stabilizing at target temperature  
+    AUTOTUNE_STABILIZING = 2,    // Stabilizing at target temperature
     AUTOTUNE_RUNNING = 3,        // Running oscillation tests
     AUTOTUNE_ANALYZING = 4,      // Analyzing collected data
     AUTOTUNE_COMPLETE = 5,       // Analysis complete
@@ -134,6 +106,7 @@ MAX6675Handler envThermocouple(ET_CS);
 
 // Function prototypes
 void initializePins();
+void initStateDefaults();
 void setupMQTT();
 void connectMQTT();
 void handleMQTTMessage(char* topic, byte* payload, unsigned int length);
@@ -168,39 +141,55 @@ void publishAutoTuneResults();
 bool checkAutoTuneCrossedSetpoint();
 bool calculateAutoTunePIDParameters();
 void resetAutoTuneData();
-const char* getAutoTuneStateString(AutoTuneState state);
+const char* getAutoTuneStateString(AutoTuneState atState);
+
+void initStateDefaults() {
+    state.beanSetpoint = 0.0;
+    state.beanTemperature = 0.0;
+    state.heaterOutput = 0.0;
+    state.envTemperature = 0.0;
+    state.fanPWM = 0;
+    state.prevFanPWM = -1;
+    state.controlMode = MODE_MANUAL;
+    state.heaterEnabled = false;
+    state.Kp = DEFAULT_KP;
+    state.Ki = DEFAULT_KI;
+    state.Kd = DEFAULT_KD;
+    state.beanTempOffset = TEMP_CALIBRATION_BEAN;
+    state.envTempOffset = TEMP_CALIBRATION_ENV;
+    state.systemStatus = SYSTEM_OK;
+}
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
     DEBUG_PRINTLN(F("Starting Coffee Roaster Control with MQTT..."));
 
+    initStateDefaults();
     EEPROM.begin(EEPROM_SIZE);
     initializePins();
 
-    // Initialize LEDC for PWM
-    ledcSetup(0, 5000, 8);
-    ledcAttachPin(SSR_PIN, 0);
-    ledcSetup(1, 5000, 8);
-    ledcAttachPin(FAN_PIN, 1);
+    // Initialize LEDC for PWM (Arduino Core 3.x API)
+    ledcAttach(SSR_PIN, 5000, 8);
+    ledcAttach(FAN_PIN, 5000, 8);
     gpio_set_drive_capability((gpio_num_t)FAN_PIN, GPIO_DRIVE_CAP_3);
 
     loadPIDParameters();
-    
+
     // Initialize WiFi
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
-    
+
     unsigned long startAttempt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
         delay(500);
         Serial.print(".");
     }
-    
+
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println(F("\nWiFi connected!"));
         Serial.printf_P(PSTR("IP Address: %s\n"), WiFi.localIP().toString().c_str());
-        
+
         setupMQTT();
         delay(100);
         connectMQTT();
@@ -216,7 +205,7 @@ void setup() {
     // Configure OTA
     ArduinoOTA.setHostname(MQTT_CLIENT_ID);
     ArduinoOTA.setPassword("roaster123");  // Set OTA password
-    
+
     ArduinoOTA.onStart([]() {
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -226,15 +215,15 @@ void setup() {
         }
         DEBUG_PRINTLN("Start updating " + type);
     });
-    
+
     ArduinoOTA.onEnd([]() {
         DEBUG_PRINTLN(F("\nEnd"));
     });
-    
+
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         DEBUG_PRINTF("Progress: %u%%\r", (progress / (total / 100)));
     });
-    
+
     ArduinoOTA.onError([](ota_error_t error) {
         DEBUG_PRINTF("Error[%u]: ", error);
         if (error == OTA_AUTH_ERROR) {
@@ -249,27 +238,32 @@ void setup() {
             DEBUG_PRINTLN(F("End Failed"));
         }
     });
-    
+
     ArduinoOTA.begin();
     DEBUG_PRINTLN(F("OTA Ready"));
 
     // Initialize PID
     beanPID.SetMode(AUTOMATIC);
     beanPID.SetOutputLimits(0, 255);
-    
+
     DEBUG_PRINTLN(F("Setup complete - All systems ready"));
 
-    esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+        .idle_core_mask = (1 << 0),
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_config);
     esp_task_wdt_add(NULL);
 }
 
 void loop() {
     esp_task_wdt_reset();
-    
+
     checkWiFiConnection();
     updateSystemStatus();
     ArduinoOTA.handle();
-    
+
     // MQTT handling
     if (!mqttClient.connected()) {
         static unsigned long lastReconnectAttempt = 0;
@@ -284,46 +278,46 @@ void loop() {
     // Read Temperatures
     if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
         lastTempRead = millis();
-        beanTemperature = beanThermocouple.readTemperature();
-        envTemperature = envThermocouple.readTemperature();
-        
-        if (!isnan(beanTemperature) && !isnan(envTemperature)) {
+        state.beanTemperature = beanThermocouple.readTemperature();
+        state.envTemperature = envThermocouple.readTemperature();
+
+        if (!isnan(state.beanTemperature) && !isnan(state.envTemperature)) {
             applyCalibration();
-            updateRateOfRise(beanTemperature);
+            updateRateOfRise(state.beanTemperature);
         }
     }
 
     // Control fan
-    ledcWrite(1, fanPWM);
+    ledcWrite(FAN_PIN, state.fanPWM);
 
     // Heater Control Logic
-    if (!heaterEnabled) {
-        heaterOutput = 0;
-        ledcWrite(0, 0);
+    if (!state.heaterEnabled) {
+        state.heaterOutput = 0;
+        ledcWrite(SSR_PIN, 0);
     } else {
-        if (controlMode == MODE_MANUAL) {
+        if (state.controlMode == MODE_MANUAL) {
             // In manual mode, heaterOutput is set directly via MQTT
-            if (fanPWM > SAFETY_MIN_FAN_PWM) {
-                ledcWrite(0, static_cast<int>(heaterOutput));
+            if (state.fanPWM > SAFETY_MIN_FAN_PWM) {
+                ledcWrite(SSR_PIN, static_cast<int>(state.heaterOutput));
             } else {
-                ledcWrite(0, 0);
+                ledcWrite(SSR_PIN, 0);
                 DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
             }
-        } else if (controlMode == MODE_AUTO) {
-            if (!isnan(beanTemperature)) {
+        } else if (state.controlMode == MODE_AUTO) {
+            if (!isnan(state.beanTemperature)) {
                 if (millis() - lastPidCompute >= PID_COMPUTE_INTERVAL) {
                     lastPidCompute = millis();
                     beanPID.Compute();
                 }
-                if (fanPWM > SAFETY_MIN_FAN_PWM) {
-                    ledcWrite(0, static_cast<int>(heaterOutput));
+                if (state.fanPWM > SAFETY_MIN_FAN_PWM) {
+                    ledcWrite(SSR_PIN, static_cast<int>(state.heaterOutput));
                 } else {
-                    ledcWrite(0, 0);
+                    ledcWrite(SSR_PIN, 0);
                     DEBUG_PRINTLN(F("Failsafe: Fan too low, heater off."));
                 }
             } else {
                 DEBUG_PRINTLN(F("Invalid bean temperature! Heater disabled."));
-                ledcWrite(0, 0);
+                ledcWrite(SSR_PIN, 0);
             }
         }
     }
@@ -335,7 +329,7 @@ void loop() {
         autoTuneState == AUTOTUNE_ANALYZING) {
         updateAutoTune();
     }
-    
+
     // Auto-tune status publishing
     if (mqttClient.connected() && millis() - lastAutoTuneStatusPublish >= autoTuneStatusPublishInterval) {
         lastAutoTuneStatusPublish = millis();
@@ -355,10 +349,10 @@ void loop() {
         lastSerialOutput = millis();
         DEBUG_PRINTLN(F("System Status:"));
         DEBUG_PRINTF("Mode: %s, BT: %.2f°C, ET: %.2f°C, ROR: %.2f°C/min\n",
-                     (controlMode == MODE_MANUAL) ? "Manual" : "Auto",
-                     beanTemperature, envTemperature, getRateOfRise());
+                     (state.controlMode == MODE_MANUAL) ? "Manual" : "Auto",
+                     state.beanTemperature, state.envTemperature, getRateOfRise());
         DEBUG_PRINTF("Heater: %d, Fan: %d, Enabled: %d, MQTT: %s\n",
-                     static_cast<int>(heaterOutput), fanPWM, heaterEnabled,
+                     static_cast<int>(state.heaterOutput), state.fanPWM, state.heaterEnabled,
                      mqttClient.connected() ? "OK" : "DISCONNECTED");
     }
 }
@@ -378,14 +372,14 @@ void connectMQTT() {
         DEBUG_PRINTLN(F("WiFi not connected - can't connect to MQTT"));
         return;
     }
-    
+
     uint8_t mac[6];
     WiFi.macAddress(mac);
     char clientId[50];
     snprintf(clientId, sizeof(clientId), "%s-%02X%02X%02X", MQTT_CLIENT_ID, mac[3], mac[4], mac[5]);
-    
+
     DEBUG_PRINTF_P(PSTR("Attempting MQTT connection as %s..."), clientId);
-    
+
     if (mqttClient.connect(
             clientId,
             MQTT_STATUS_TOPIC,
@@ -394,13 +388,13 @@ void connectMQTT() {
             "{\"status\":\"offline\"}"
         )) {
         DEBUG_PRINTLN(F(" connected!"));
-    
+
         // Subscribe to all control topics
         String controlPattern = String(MQTT_CONTROL_TOPIC) + "/#";
         if (mqttClient.subscribe(controlPattern.c_str())) {
             DEBUG_PRINTLN(F("Subscribed to control topics"));
         }
-        
+
         // Subscribe to auto-tune topics
         if (mqttClient.subscribe(MQTT_AUTOTUNE_START_TOPIC)) {
             DEBUG_PRINTLN(F("Subscribed to auto-tune start topic"));
@@ -420,15 +414,15 @@ void connectMQTT() {
         doc["rssi"] = WiFi.RSSI();
         String statusMsg;
         serializeJson(doc, statusMsg);
-        mqttClient.publish(MQTT_STATUS_TOPIC, statusMsg.c_str(), true);   
+        mqttClient.publish(MQTT_STATUS_TOPIC, statusMsg.c_str(), true);
     } else {
-        int state = mqttClient.state();
-        DEBUG_PRINTF(" failed, rc=%d\n", state);
-        
+        int mqttState = mqttClient.state();
+        DEBUG_PRINTF(" failed, rc=%d\n", mqttState);
+
         DEBUG_PRINTF("Network diagnostics:\n");
         DEBUG_PRINTF("- WiFi RSSI: %d dBm\n", WiFi.RSSI());
         DEBUG_PRINTF("- Local IP: %s\n", WiFi.localIP().toString().c_str());
-        
+
         IPAddress brokerIP;
         if (WiFi.hostByName(MQTT_BROKER, brokerIP)) {
             DEBUG_PRINTF("- Broker IP resolved: %s\n", brokerIP.toString().c_str());
@@ -447,13 +441,13 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
     }
 
     DEBUG_PRINTF_P(PSTR("MQTT RX: %s = %s\n"), topic, payloadStr.c_str());
-    
+
     String controlTopicBase = String(MQTT_CONTROL_TOPIC);
-    
+
     if (topicStr.startsWith(controlTopicBase)) {
         String command = topicStr.substring(controlTopicBase.length());
         if (command.startsWith("/")) command.remove(0, 1);
-        
+
         // Dispatch to individual handlers
         if (command == "setpoint") {
             handleControlSetpoint(payloadStr);
@@ -477,7 +471,7 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
             handleEmergencyStop(payloadStr);
         }
     }
-    
+
     // Handle auto-tune topics
     if (topicStr == MQTT_AUTOTUNE_START_TOPIC) {
         handleAutoTuneStart(payloadStr);
@@ -492,27 +486,27 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
 
 void publishMQTTTelemetry() {
     DynamicJsonDocument doc(512);
-    
+
     doc["timestamp"] = millis();
-    doc["beanTemp"] = round(beanTemperature * 10) / 10.0;
-    doc["envTemp"] = round(envTemperature * 10) / 10.0;
+    doc["beanTemp"] = round(state.beanTemperature * 10) / 10.0;
+    doc["envTemp"] = round(state.envTemperature * 10) / 10.0;
     doc["rateOfRise"] = round(getRateOfRise() * 100) / 100.0;
-    doc["heaterPWM"] = static_cast<int>(heaterOutput * 100 / 255);  // Convert to percentage like original
-    doc["fanPWM"] = fanPWM;
-    doc["setpoint"] = round(beanSetpoint * 10) / 10.0;
-    doc["controlMode"] = controlMode;
-    doc["heaterEnable"] = heaterEnabled ? 1 : 0;  // Match original field name
+    doc["heaterPWM"] = static_cast<int>(state.heaterOutput * 100 / 255);  // Convert to percentage like original
+    doc["fanPWM"] = state.fanPWM;
+    doc["setpoint"] = round(state.beanSetpoint * 10) / 10.0;
+    doc["controlMode"] = state.controlMode;
+    doc["heaterEnable"] = state.heaterEnabled ? 1 : 0;  // Match original field name
     doc["uptime"] = millis() / 1000;
-    doc["Kp"] = Kp;
-    doc["Ki"] = Ki;  
-    doc["Kd"] = Kd;
+    doc["Kp"] = state.Kp;
+    doc["Ki"] = state.Ki;
+    doc["Kd"] = state.Kd;
     doc["freeHeap"] = ESP.getFreeHeap();
     doc["rssi"] = WiFi.RSSI();
-    doc["systemStatus"] = systemStatus;
-    
+    doc["systemStatus"] = state.systemStatus;
+
     String payload;
     serializeJson(doc, payload);
-    
+
     mqttClient.publish(MQTT_TELEMETRY_TOPIC, payload.c_str());
     DEBUG_PRINTF("MQTT: Published telemetry (%d bytes)\n", payload.length());
 }
@@ -525,10 +519,10 @@ void publishMQTTStatus(const String& status) {
     doc["rssi"] = WiFi.RSSI();
     doc["freeHeap"] = ESP.getFreeHeap();
     doc["version"] = "2.0.0-mqtt-only";
-    
+
     String payload;
     serializeJson(doc, payload);
-    
+
     mqttClient.publish(MQTT_STATUS_TOPIC, payload.c_str(), true);
 }
 
@@ -541,13 +535,13 @@ void updateRateOfRise(float currentTemp) {
 
 float getRateOfRise() {
     if (historyCount < 3) return 0.0;
-    
+
     int startIdx = (historyIndex - historyCount + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
     int endIdx = (historyIndex - 1 + RATE_HISTORY_SIZE) % RATE_HISTORY_SIZE;
-    
+
     float tempDiff = tempHistory[endIdx] - tempHistory[startIdx];
     float timeDiff = (timeHistory[endIdx] - timeHistory[startIdx]) / 1000.0;
-    
+
     if (timeDiff > 0) {
         return (tempDiff / timeDiff) * 60.0;
     }
@@ -562,8 +556,8 @@ void initializePins() {
 }
 
 void applyCalibration() {
-    beanTemperature += beanTempOffset;
-    envTemperature += envTempOffset;
+    state.beanTemperature += state.beanTempOffset;
+    state.envTemperature += state.envTempOffset;
 }
 
 void updatePIDParameters() {
@@ -571,9 +565,9 @@ void updatePIDParameters() {
 }
 
 void savePIDParameters() {
-    EEPROM.put(0, Kp);
-    EEPROM.put(8, Ki);
-    EEPROM.put(16, Kd);
+    EEPROM.put(0, state.Kp);
+    EEPROM.put(8, state.Ki);
+    EEPROM.put(16, state.Kd);
     EEPROM.commit();
     DEBUG_PRINTLN(F("PID Parameters Saved to EEPROM"));
 }
@@ -584,32 +578,32 @@ void loadPIDParameters() {
     EEPROM.get(0, tempKp);
     EEPROM.get(8, tempKi);
     EEPROM.get(16, tempKd);
-    
+
     // Validate EEPROM data (check for reasonable PID values)
     bool validData = true;
     if (isnan(tempKp) || tempKp <= 0 || tempKp > 1000) validData = false;
     if (isnan(tempKi) || tempKi < 0 || tempKi > 100) validData = false;
     if (isnan(tempKd) || tempKd < 0 || tempKd > 1000) validData = false;
-    
+
     if (validData) {
         // Use EEPROM values
-        Kp = tempKp;
-        Ki = tempKi;
-        Kd = tempKd;
+        state.Kp = tempKp;
+        state.Ki = tempKi;
+        state.Kd = tempKd;
         DEBUG_PRINTLN(F("PID Parameters Loaded from EEPROM"));
-        DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
+        DEBUG_PRINTF("Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
     } else {
         // Use default values and save them to EEPROM
-        Kp = DEFAULT_KP;
-        Ki = DEFAULT_KI;
-        Kd = DEFAULT_KD;
+        state.Kp = DEFAULT_KP;
+        state.Ki = DEFAULT_KI;
+        state.Kd = DEFAULT_KD;
         savePIDParameters();
         DEBUG_PRINTLN(F("EEPROM invalid - using default PID parameters"));
-        DEBUG_PRINTF("Default PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
+        DEBUG_PRINTF("Default PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", state.Kp, state.Ki, state.Kd);
     }
-    
+
     // Apply the PID parameters to the controller
-    beanPID.SetTunings(Kp, Ki, Kd);
+    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -619,7 +613,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void checkWiFiConnection() {
     static unsigned long lastWiFiCheck = 0;
     const unsigned long wifiCheckInterval = WIFI_CHECK_INTERVAL;
-    
+
     if (millis() - lastWiFiCheck >= wifiCheckInterval) {
         lastWiFiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) {
@@ -633,21 +627,21 @@ void checkWiFiConnection() {
 void updateSystemStatus() {
     if (millis() - lastStatusUpdate >= statusUpdateInterval) {
         lastStatusUpdate = millis();
-        
-        SystemStatus oldStatus = systemStatus;
-        systemStatus = SYSTEM_OK;
-        
+
+        SystemStatus oldStatus = state.systemStatus;
+        state.systemStatus = SYSTEM_OK;
+
         // Check connectivity
         SystemStatus connStatus = checkConnectivity();
-        if (connStatus != SYSTEM_OK) systemStatus = connStatus;
-        
+        if (connStatus != SYSTEM_OK) state.systemStatus = connStatus;
+
         // Check sensors
         SystemStatus sensorStatus = checkSensors();
-        if (sensorStatus != SYSTEM_OK) systemStatus = sensorStatus;
-        
+        if (sensorStatus != SYSTEM_OK) state.systemStatus = sensorStatus;
+
         // Log status changes
-        if (systemStatus != oldStatus) {
-            DEBUG_PRINTF_P(PSTR("System status changed: %d -> %d\n"), oldStatus, systemStatus);
+        if (state.systemStatus != oldStatus) {
+            DEBUG_PRINTF_P(PSTR("System status changed: %d -> %d\n"), oldStatus, state.systemStatus);
         }
     }
 }
@@ -663,13 +657,13 @@ SystemStatus checkConnectivity() {
 }
 
 SystemStatus checkSensors() {
-    if (isnan(beanTemperature) || isnan(envTemperature)) {
+    if (isnan(state.beanTemperature) || isnan(state.envTemperature)) {
         return SENSOR_ERROR;
     }
-    if (beanTemperature < -50 || beanTemperature > 300) {
+    if (state.beanTemperature < -50 || state.beanTemperature > 300) {
         return SENSOR_ERROR;
     }
-    if (envTemperature < -50 || envTemperature > 300) {
+    if (state.envTemperature < -50 || state.envTemperature > 300) {
         return SENSOR_ERROR;
     }
     return SYSTEM_OK;
@@ -678,7 +672,7 @@ SystemStatus checkSensors() {
 void handleControlSetpoint(const String& payload) {
     float newSetpoint = payload.toFloat();
     if (newSetpoint >= MIN_BEAN_TEMP && newSetpoint <= MAX_BEAN_TEMP) {
-        beanSetpoint = newSetpoint;
+        state.beanSetpoint = newSetpoint;
         DEBUG_PRINTF_P(PSTR("MQTT: Setpoint set to %.1f°C\n"), newSetpoint);
     }
 }
@@ -686,7 +680,7 @@ void handleControlSetpoint(const String& payload) {
 void handleControlFan(const String& payload) {
     int newFanPWM = payload.toInt();
     if (newFanPWM >= 0 && newFanPWM <= 255) {
-        fanPWM = newFanPWM;
+        state.fanPWM = newFanPWM;
         DEBUG_PRINTF_P(PSTR("MQTT: Fan PWM set to %d\n"), newFanPWM);
     }
 }
@@ -694,24 +688,24 @@ void handleControlFan(const String& payload) {
 void handleControlHeater(const String& payload) {
     int newHeaterPWM = payload.toInt();
     if (newHeaterPWM >= MIN_HEATER_PWM && newHeaterPWM <= MAX_HEATER_PWM) {
-        heaterOutput = newHeaterPWM * 255 / 100;  // Convert percentage to 0-255
+        state.heaterOutput = newHeaterPWM * 255 / 100;  // Convert percentage to 0-255
         DEBUG_PRINTF_P(PSTR("MQTT: Heater PWM set to %d%%\n"), newHeaterPWM);
     }
 }
 
 void handleControlMode(const String& payload) {
     if (payload == "manual" || payload == "0") {
-        controlMode = MODE_MANUAL;
+        state.controlMode = MODE_MANUAL;
         DEBUG_PRINTLN(F("MQTT: Mode set to Manual"));
     } else if (payload == "auto" || payload == "1") {
-        controlMode = MODE_AUTO;
+        state.controlMode = MODE_AUTO;
         DEBUG_PRINTLN(F("MQTT: Mode set to Auto"));
     }
 }
 
 void handleControlEnable(const String& payload) {
-    heaterEnabled = (payload == "1" || payload == "true");
-    DEBUG_PRINTF_P(PSTR("MQTT: Heater enable set to %d\n"), heaterEnabled ? 1 : 0);
+    state.heaterEnabled = (payload == "1" || payload == "true");
+    DEBUG_PRINTF_P(PSTR("MQTT: Heater enable set to %d\n"), state.heaterEnabled ? 1 : 0);
 }
 
 void handleControlPID(const String& payload) {
@@ -719,23 +713,23 @@ void handleControlPID(const String& payload) {
     DynamicJsonDocument doc(256);
     DeserializationError error = deserializeJson(doc, payload);
     if (!error) {
-        if (doc.containsKey("kp")) Kp = doc["kp"];
-        if (doc.containsKey("ki")) Ki = doc["ki"];
-        if (doc.containsKey("kd")) Kd = doc["kd"];
-        beanPID.SetTunings(Kp, Ki, Kd);
+        if (doc.containsKey("kp")) state.Kp = doc["kp"];
+        if (doc.containsKey("ki")) state.Ki = doc["ki"];
+        if (doc.containsKey("kd")) state.Kd = doc["kd"];
+        beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
         savePIDParameters();
-        DEBUG_PRINTF_P(PSTR("MQTT: PID updated Kp=%.2f, Ki=%.2f, Kd=%.2f\n"), Kp, Ki, Kd);
+        DEBUG_PRINTF_P(PSTR("MQTT: PID updated Kp=%.2f, Ki=%.2f, Kd=%.2f\n"), state.Kp, state.Ki, state.Kd);
     }
 }
 
 void handleEmergencyStop(const String& payload) {
     if (payload == "1" || payload == "true") {
         DEBUG_PRINTLN(F("MQTT: EMERGENCY STOP RECEIVED!"));
-        heaterEnabled = false;
-        fanPWM = 255;
-        heaterOutput = 0;
-        ledcWrite(0, 0);
-        ledcWrite(1, 255);
+        state.heaterEnabled = false;
+        state.fanPWM = 255;
+        state.heaterOutput = 0;
+        ledcWrite(SSR_PIN, 0);
+        ledcWrite(FAN_PIN, 255);
     }
 }
 
@@ -744,25 +738,25 @@ void handleAutoTuneStart(const String& payload) {
     // Parse JSON payload for target temperature
     DynamicJsonDocument doc(256);
     DeserializationError error = deserializeJson(doc, payload);
-    
+
     if (error) {
         DEBUG_PRINTLN(F("Auto-tune start: Invalid JSON payload"));
         return;
     }
-    
+
     double targetTemp = doc["target_temperature"].as<double>();
     if (targetTemp < 150.0 || targetTemp > 250.0) {
         DEBUG_PRINTLN(F("Auto-tune start: Invalid target temperature"));
         return;
     }
-    
+
     if (autoTuneState != AUTOTUNE_IDLE) {
         DEBUG_PRINTLN(F("Auto-tune already running"));
         return;
     }
-    
+
     DEBUG_PRINTF("Starting auto-tune for target temperature: %.1f°C\n", targetTemp);
-    
+
     // Initialize auto-tune
     autoTuneTargetTemp = targetTemp;
     autoTuneSetpoint = targetTemp;
@@ -773,79 +767,79 @@ void handleAutoTuneStart(const String& payload) {
     autoTuneReachedSetpoint = false;
     autoTuneStabilizationStartTime = 0;
     autoTuneStepTimeout = AUTOTUNE_MAX_STEP_TIME;
-    
+
     // Save original PID parameters
-    autoTuneOriginalKp = Kp;
-    autoTuneOriginalKi = Ki;
-    autoTuneOriginalKd = Kd;
-    
+    autoTuneOriginalKp = state.Kp;
+    autoTuneOriginalKi = state.Ki;
+    autoTuneOriginalKd = state.Kd;
+
     // Reset data arrays
     resetAutoTuneData();
-    
+
     // Switch to manual mode for auto-tune
-    controlMode = MODE_MANUAL;
-    beanSetpoint = autoTuneTargetTemp;
-    
+    state.controlMode = MODE_MANUAL;
+    state.beanSetpoint = autoTuneTargetTemp;
+
     // Start with full heating output for initial heating phase
-    heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;  // Convert percentage to PWM
-    heaterEnabled = true;
-    
+    state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;  // Convert percentage to PWM
+    state.heaterEnabled = true;
+
     publishAutoTuneStatus();
 }
 
 void handleAutoTuneStop(const String& payload) {
     DEBUG_PRINTLN(F("Stopping auto-tune"));
-    
+
     // Reset to original PID parameters
-    Kp = autoTuneOriginalKp;
-    Ki = autoTuneOriginalKi;
-    Kd = autoTuneOriginalKd;
-    beanPID.SetTunings(Kp, Ki, Kd);
-    
+    state.Kp = autoTuneOriginalKp;
+    state.Ki = autoTuneOriginalKi;
+    state.Kd = autoTuneOriginalKd;
+    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
+
     // Reset state
     autoTuneState = AUTOTUNE_IDLE;
-    controlMode = MODE_AUTO;  // Return to auto mode
-    heaterOutput = 0;
-    heaterEnabled = false;
-    
+    state.controlMode = MODE_AUTO;  // Return to auto mode
+    state.heaterOutput = 0;
+    state.heaterEnabled = false;
+
     publishAutoTuneStatus();
 }
 
 void handleAutoTuneApply(const String& payload) {
     DEBUG_PRINTLN(F("Applying auto-tune results"));
-    
+
     // Only apply if we have completed auto-tune results
     if (autoTuneState != AUTOTUNE_COMPLETE) {
         DEBUG_PRINTLN(F("Auto-tune apply: No completed results to apply"));
         return;
     }
-    
+
     // Validate that we have valid PID results
     if (autoTuneRecommendedKp <= 0 || autoTuneRecommendedKi < 0 || autoTuneRecommendedKd < 0) {
         DEBUG_PRINTLN(F("Auto-tune apply: Invalid PID parameters"));
         return;
     }
-    
-    DEBUG_PRINTF("Applying auto-tune results: Kp=%.2f, Ki=%.4f, Kd=%.2f\n", 
+
+    DEBUG_PRINTF("Applying auto-tune results: Kp=%.2f, Ki=%.4f, Kd=%.2f\n",
                  autoTuneRecommendedKp, autoTuneRecommendedKi, autoTuneRecommendedKd);
-    
+
     // Apply the recommended PID parameters
-    Kp = autoTuneRecommendedKp;
-    Ki = autoTuneRecommendedKi; 
-    Kd = autoTuneRecommendedKd;
-    
+    state.Kp = autoTuneRecommendedKp;
+    state.Ki = autoTuneRecommendedKi;
+    state.Kd = autoTuneRecommendedKd;
+
     // Update the PID controller
-    beanPID.SetTunings(Kp, Ki, Kd);
-    
+    beanPID.SetTunings(state.Kp, state.Ki, state.Kd);
+
     // Save to EEPROM for persistence
     savePIDParameters();
-    
+
     // Reset auto-tune state to idle
     autoTuneState = AUTOTUNE_IDLE;
-    controlMode = MODE_AUTO;  // Return to auto mode with new PID parameters
-    
+    state.controlMode = MODE_AUTO;  // Return to auto mode with new PID parameters
+
     DEBUG_PRINTLN(F("Auto-tune results applied and saved to EEPROM"));
-    
+
     // Publish updated status
     publishAutoTuneStatus();
 }
@@ -854,9 +848,9 @@ void updateAutoTune() {
     if (autoTuneState != AUTOTUNE_RUNNING && autoTuneState != AUTOTUNE_ANALYZING && autoTuneState != AUTOTUNE_HEATING && autoTuneState != AUTOTUNE_STABILIZING) {
         return;
     }
-    
+
     unsigned long now = millis();
-    
+
     // Check for timeout
     if (now - autoTuneStartTime > AUTOTUNE_MAX_DURATION) {
         DEBUG_PRINTLN(F("Auto-tune timeout"));
@@ -864,46 +858,46 @@ void updateAutoTune() {
         handleAutoTuneStop("");  // Stop with empty payload
         return;
     }
-    
+
     // Add current temperature to history
     if (autoTuneTempHistoryCount < 20) {
-        autoTuneTempHistory[autoTuneTempHistoryIndex] = beanTemperature;
+        autoTuneTempHistory[autoTuneTempHistoryIndex] = state.beanTemperature;
         autoTuneTempTimeHistory[autoTuneTempHistoryIndex] = now;
         autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % 20;
         autoTuneTempHistoryCount++;
     } else {
-        autoTuneTempHistory[autoTuneTempHistoryIndex] = beanTemperature;
+        autoTuneTempHistory[autoTuneTempHistoryIndex] = state.beanTemperature;
         autoTuneTempTimeHistory[autoTuneTempHistoryIndex] = now;
         autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % 20;
     }
-    
+
     if (autoTuneState == AUTOTUNE_HEATING) {
         // Initial heating phase - bring system to target temperature with proportional control
-        double tempError = autoTuneSetpoint - beanTemperature;
-        
+        double tempError = autoTuneSetpoint - state.beanTemperature;
+
         if (tempError > 50) {
             // Far from target - use high heating power
-            heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
+            state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
         } else if (tempError > 10) {
             // Approaching target - reduce power proportionally from (bias+amp) down to ~bias
             double powerRatio = tempError / 50.0; // 1.0 .. 0.2 as error 50..10
             double pct = autoTuneOutputBias + autoTuneOutputAmplitude * powerRatio;
-            heaterOutput = pct * 255 / 100;
+            state.heaterOutput = pct * 255 / 100;
         } else if (tempError > 0) {
             // Very close to target: keep at baseline bias to continue approaching setpoint
             double pct = autoTuneOutputBias; // do not drop below bias while below setpoint
-            heaterOutput = pct * 255 / 100;
+            state.heaterOutput = pct * 255 / 100;
         } else {
             // Above target - turn off heater completely
-            heaterOutput = 0;
+            state.heaterOutput = 0;
         }
         // Clamp and debug
-        if (heaterOutput > 255) heaterOutput = 255;
-        if (heaterOutput < 0) heaterOutput = 0;
-        DEBUG_PRINTF("Auto-tune HEATING: err=%.1fC, out=%.0f\n", tempError, heaterOutput);
-        
+        if (state.heaterOutput > 255) state.heaterOutput = 255;
+        if (state.heaterOutput < 0) state.heaterOutput = 0;
+        DEBUG_PRINTF("Auto-tune HEATING: err=%.1fC, out=%.0f\n", tempError, state.heaterOutput);
+
         // Check if we've reached within tolerance of setpoint
-        float absErr = abs(beanTemperature - autoTuneSetpoint);
+        float absErr = abs(state.beanTemperature - autoTuneSetpoint);
         if (absErr <= AUTOTUNE_SETPOINT_TOLERANCE) {
             if (!autoTuneReachedSetpoint) {
                 autoTuneReachedSetpoint = true;
@@ -958,16 +952,14 @@ void updateAutoTune() {
             }
 
             // Fast-track B: Equilibrium at bias regardless of original setpoint
-            // If heater is at baseline bias and temperature is stable (low RoR) for a period, accept current temp
-            // as the setpoint for oscillation. This avoids manual fan changes to reach the target.
             float absRor2 = fabs(getRateOfRise());
-            if (beanTemperature >= AUTOTUNE_EQUIL_MIN_TEMP && absRor2 <= AUTOTUNE_STABILITY_ROR) {
+            if (state.beanTemperature >= AUTOTUNE_EQUIL_MIN_TEMP && absRor2 <= AUTOTUNE_STABILITY_ROR) {
                 if (autoTuneRorStableStartTime == 0) autoTuneRorStableStartTime = now;
             } else {
                 autoTuneRorStableStartTime = 0;
             }
             if (autoTuneRorStableStartTime != 0 && (now - autoTuneRorStableStartTime) >= AUTOTUNE_FASTTRACK_ROR_TIME) {
-                autoTuneSetpoint = beanTemperature; // anchor oscillation around current equilibrium
+                autoTuneSetpoint = state.beanTemperature; // anchor oscillation around current equilibrium
                 autoTuneState = AUTOTUNE_STABILIZING;
                 autoTuneCurrentStep = 1;
                 autoTuneStepStartTime = now;
@@ -976,12 +968,12 @@ void updateAutoTune() {
                 DEBUG_PRINTF("Auto-tune equilibrium accepted at %.1f°C, proceeding to stabilizing.\n", autoTuneSetpoint);
             }
         }
-        
+
         // Check for heating timeout
         if (now - autoTuneStartTime >= AUTOTUNE_INITIAL_STEP_TIME) {
             DEBUG_PRINTLN(F("Auto-tune heating phase timeout: forcing progression using equilibrium"));
             // Accept current equilibrium to avoid stalling
-            autoTuneSetpoint = beanTemperature;
+            autoTuneSetpoint = state.beanTemperature;
             autoTuneState = AUTOTUNE_STABILIZING;
             autoTuneCurrentStep = 1;
             autoTuneStepStartTime = now;
@@ -991,23 +983,23 @@ void updateAutoTune() {
     }
     else if (autoTuneState == AUTOTUNE_STABILIZING) {
         // Stabilizing phase - maintain baseline output
-        heaterOutput = autoTuneOutputBias * 255 / 100;
-        
+        state.heaterOutput = autoTuneOutputBias * 255 / 100;
+
         // Check if stable for minimum time before starting oscillation
         if (now - autoTuneStepStartTime >= AUTOTUNE_MIN_STEP_TIME) {
             autoTuneState = AUTOTUNE_RUNNING;
             autoTuneCurrentStep = 1;
             autoTuneStepStartTime = now;
             // Immediately choose an initial oscillation side based on current temp
-            if (beanTemperature <= autoTuneSetpoint) {
+            if (state.beanTemperature <= autoTuneSetpoint) {
                 autoTuneOutputHigh = true;
-                heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
+                state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
             } else {
                 autoTuneOutputHigh = false;
-                heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
+                state.heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
             }
-            if (heaterOutput > 255) heaterOutput = 255;
-            if (heaterOutput < 0) heaterOutput = 0;
+            if (state.heaterOutput > 255) state.heaterOutput = 255;
+            if (state.heaterOutput < 0) state.heaterOutput = 0;
             DEBUG_PRINTLN(F("Auto-tune starting oscillation phase"));
         }
     }
@@ -1015,41 +1007,41 @@ void updateAutoTune() {
         // Oscillation phase - relay with hysteresis around setpoint
         unsigned long stepDuration = now - autoTuneStepStartTime;
         unsigned long stepTimeout = (autoTuneCurrentStep <= 2) ? AUTOTUNE_INITIAL_STEP_TIME : autoTuneStepTimeout;
-        float error = beanTemperature - autoTuneSetpoint;
+        float error = state.beanTemperature - autoTuneSetpoint;
 
         bool toggled = false;
         if (autoTuneOutputHigh) {
             if (error >= AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
                 // Record peak on high-to-low transition
                 if (autoTunePeakCount < 10) {
-                    autoTunePeaks[autoTunePeakCount].temperature = beanTemperature;
+                    autoTunePeaks[autoTunePeakCount].temperature = state.beanTemperature;
                     autoTunePeaks[autoTunePeakCount].time = now / 1000.0f;
                     autoTunePeakCount++;
                 }
                 autoTuneOutputHigh = false;
                 toggled = true;
-                heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
+                state.heaterOutput = (autoTuneOutputBias - autoTuneOutputAmplitude) * 255 / 100;
             }
         } else {
             if (error <= -AUTOTUNE_RELAY_HYST || stepDuration >= stepTimeout) {
                 // Record valley on low-to-high transition
                 if (autoTuneValleyCount < 10) {
-                    autoTuneValleys[autoTuneValleyCount].temperature = beanTemperature;
+                    autoTuneValleys[autoTuneValleyCount].temperature = state.beanTemperature;
                     autoTuneValleys[autoTuneValleyCount].time = now / 1000.0f;
                     autoTuneValleyCount++;
                 }
                 autoTuneOutputHigh = true;
                 toggled = true;
-                heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
+                state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
             }
         }
 
         if (toggled) {
             autoTuneCurrentStep++;
             autoTuneStepStartTime = now;
-            if (heaterOutput > 255) heaterOutput = 255;
-            if (heaterOutput < 0) heaterOutput = 0;
-            DEBUG_PRINTF("Auto-tune step %d: output = %.0f, error=%.1f\n", autoTuneCurrentStep, heaterOutput, error);
+            if (state.heaterOutput > 255) state.heaterOutput = 255;
+            if (state.heaterOutput < 0) state.heaterOutput = 0;
+            DEBUG_PRINTF("Auto-tune step %d: output = %.0f, error=%.1f\n", autoTuneCurrentStep, state.heaterOutput, error);
             if (autoTuneCurrentStep >= AUTOTUNE_TOTAL_STEPS) {
                 autoTuneState = AUTOTUNE_ANALYZING;
                 DEBUG_PRINTLN(F("Auto-tune data collection complete, analyzing..."));
@@ -1063,29 +1055,29 @@ void updateAutoTune() {
             DEBUG_PRINTLN(F("Auto-tune complete!"));
         } else {
             // Fallback: use current PID as conservative recommendation and mark complete
-            autoTuneRecommendedKp = Kp;
-            autoTuneRecommendedKi = Ki;
-            autoTuneRecommendedKd = Kd;
+            autoTuneRecommendedKp = state.Kp;
+            autoTuneRecommendedKi = state.Ki;
+            autoTuneRecommendedKd = state.Kd;
             autoTuneUsedFallback = true;
             autoTuneState = AUTOTUNE_COMPLETE;
             DEBUG_PRINTLN(F("Auto-tune: fallback PID used due to insufficient oscillation data"));
         }
         publishAutoTuneResults();
         // Safe state: disable heater, return to auto control awaiting apply/stop
-        heaterEnabled = false;
-        controlMode = MODE_AUTO;
+        state.heaterEnabled = false;
+        state.controlMode = MODE_AUTO;
         publishAutoTuneStatus();
     }
 }
 
 void publishAutoTuneStatus() {
     if (!mqttClient.connected()) return;
-    
+
     DynamicJsonDocument doc(512);
-    
+
     doc["state"] = getAutoTuneStateString(autoTuneState);
     doc["message"] = getAutoTuneStateString(autoTuneState);
-    
+
     if (autoTuneState == AUTOTUNE_RUNNING || autoTuneState == AUTOTUNE_ANALYZING) {
         // Calculate progress based on steps completed
         float progress = ((float)autoTuneCurrentStep / AUTOTUNE_TOTAL_STEPS) * 100.0;
@@ -1100,7 +1092,7 @@ void publishAutoTuneStatus() {
         doc["current_step"] = nullptr;
         doc["total_steps"] = AUTOTUNE_TOTAL_STEPS;
     }
-    
+
     if (autoTuneState == AUTOTUNE_COMPLETE) {
         doc["recommended_kp"] = autoTuneRecommendedKp;
         doc["recommended_ki"] = autoTuneRecommendedKi;
@@ -1111,21 +1103,21 @@ void publishAutoTuneStatus() {
         doc["recommended_ki"] = nullptr;
         doc["recommended_kd"] = nullptr;
     }
-    
+
     doc["timestamp"] = millis();
-    
+
     String payload;
     serializeJson(doc, payload);
-    
+
     mqttClient.publish(MQTT_AUTOTUNE_STATUS_TOPIC, payload.c_str(), true);  // Retained message
     DEBUG_PRINTF("MQTT: Published auto-tune status (%d bytes)\n", payload.length());
 }
 
 void publishAutoTuneResults() {
     if (!mqttClient.connected()) return;
-    
+
     DynamicJsonDocument doc(512);
-    
+
     doc["state"] = "complete";
     doc["recommended_kp"] = autoTuneRecommendedKp;
     doc["recommended_ki"] = autoTuneRecommendedKi;
@@ -1139,29 +1131,29 @@ void publishAutoTuneResults() {
     doc["valley_count"] = autoTuneValleyCount;
     doc["timestamp"] = millis();
     doc["duration"] = (millis() - autoTuneStartTime) / 1000; // Duration in seconds
-    
+
     String payload;
     serializeJson(doc, payload);
-    
+
     mqttClient.publish(MQTT_AUTOTUNE_RESULTS_TOPIC, payload.c_str(), true);  // Retained message
     DEBUG_PRINTF("MQTT: Published auto-tune results (%d bytes)\n", payload.length());
 }
 
 bool checkAutoTuneCrossedSetpoint() {
     if (autoTuneTempHistoryCount < 3) return false;
-    
+
     // Check if temperature crossed setpoint in recent history
     int recentIdx = (autoTuneTempHistoryIndex - 1 + 20) % 20;
     int prevIdx = (autoTuneTempHistoryIndex - 2 + 20) % 20;
-    
+
     float current = autoTuneTempHistory[recentIdx];
     float previous = autoTuneTempHistory[prevIdx];
-    
+
     // Check for crossing (either direction) around the active oscillation setpoint
     const float ref = autoTuneSetpoint; // use current setpoint (may be equilibrium)
     bool crossed = (previous < ref && current >= ref) ||
                    (previous > ref && current <= ref);
-    
+
     if (crossed) {
         // Record peak or valley
         if (autoTunePeakCount < 10 && current > ref) {
@@ -1170,7 +1162,7 @@ bool checkAutoTuneCrossedSetpoint() {
             autoTunePeakCount++;
             DEBUG_PRINTF("Auto-tune peak %d: %.2f°C\n", autoTunePeakCount, current);
         }
-        
+
         if (autoTuneValleyCount < 10 && current < ref) {
             autoTuneValleys[autoTuneValleyCount].temperature = current;
             autoTuneValleys[autoTuneValleyCount].time = autoTuneTempTimeHistory[recentIdx] / 1000.0;
@@ -1178,7 +1170,7 @@ bool checkAutoTuneCrossedSetpoint() {
             DEBUG_PRINTF("Auto-tune valley %d: %.2f°C\n", autoTuneValleyCount, current);
         }
     }
-    
+
     return crossed;
 }
 
@@ -1259,7 +1251,7 @@ bool calculateAutoTunePIDParameters() {
     float outputSwing = autoTuneOutputAmplitude * 2;  // total percentage swing
     float Ku = (outputSwing * 4) / (avgAmplitude * 3.14159f);  // heuristic
 
-    // Ziegler–Nichols PID rules
+    // Ziegler-Nichols PID rules
     autoTuneRecommendedKp = 0.6f * Ku;
     autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
     autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 8.0f;
@@ -1287,8 +1279,8 @@ void resetAutoTuneData() {
     autoTuneRecommendedKd = 0;
 }
 
-const char* getAutoTuneStateString(AutoTuneState state) {
-    switch (state) {
+const char* getAutoTuneStateString(AutoTuneState atState) {
+    switch (atState) {
         case AUTOTUNE_IDLE: return "idle";
         case AUTOTUNE_HEATING: return "heating";
         case AUTOTUNE_STABILIZING: return "stabilizing";
@@ -1299,4 +1291,3 @@ const char* getAutoTuneStateString(AutoTuneState state) {
         default: return "unknown";
     }
 }
-
