@@ -4,18 +4,15 @@
 #include "roaster_state.h"
 #include "safety.h"
 #include "temperature.h"
+#include "mqtt_handler.h"
 
 // Consecutive NaN counters per thermocouple
 static int beanNanCount = 0;
 static int envNanCount = 0;
 
-// MQTT connection tracking
-static unsigned long lastMqttConnectedTime = 0;
-
 void initSafety() {
     beanNanCount = 0;
     envNanCount = 0;
-    lastMqttConnectedTime = millis();
 }
 
 void triggerSafeShutdown() {
@@ -34,9 +31,8 @@ void resetSafety() {
     state.systemStatus = SYSTEM_OK;
 }
 
-// Call this from mqtt_handler or main when MQTT is connected
 void safetyNotifyMqttConnected() {
-    lastMqttConnectedTime = millis();
+    // No-op now; getLastConnectedTime() handles tracking
 }
 
 void runSafetyChecks() {
@@ -93,14 +89,8 @@ void runSafetyChecks() {
     }
 
     // --- MQTT communication timeout ---
-    // Track MQTT connected state
-    // Note: Until US-012 replaces PubSubClient, we check via extern mqttClient
-    // After US-012, this will use mqtt_handler's isConnected()/getLastConnectedTime()
-    extern bool safetyMqttConnected;
-    if (safetyMqttConnected) {
-        lastMqttConnectedTime = millis();
-    }
-    if (millis() - lastMqttConnectedTime > SAFETY_MQTT_TIMEOUT_MS) {
+    unsigned long lastConn = getLastConnectedTime();
+    if (millis() - lastConn > SAFETY_MQTT_TIMEOUT_MS) {
         DEBUG_PRINTLN(F("SAFETY: MQTT timeout — entering safe state"));
         state.systemStatus = COMMS_TIMEOUT;
         triggerSafeShutdown();
