@@ -84,35 +84,34 @@ extern const char* password;
 #define DEFAULT_KD 25.0
 
 // Auto-tune Configuration
-#define AUTOTUNE_MIN_STEP_TIME 10000
-#define AUTOTUNE_MAX_STEP_TIME 90000
-#define AUTOTUNE_INITIAL_STEP_TIME 120000
-#define AUTOTUNE_MAX_DURATION 1800000
-#define AUTOTUNE_OUTPUT_AMPLITUDE 25
-#define AUTOTUNE_OUTPUT_BIAS 50
-#define AUTOTUNE_MIN_PEAKS 3
-#define AUTOTUNE_MIN_VALLEYS 3
-#define AUTOTUNE_TOTAL_STEPS 12
-#define AUTOTUNE_SETPOINT_TOLERANCE 2.5
-#define AUTOTUNE_STABILIZATION_TIME 45000
-#define AUTOTUNE_STABILITY_ROR 2.0
-#define AUTOTUNE_STABILITY_ROR_TIME 8000
-// Minimum fraction of target temp for equilibrium acceptance (0.0-1.0)
-#define AUTOTUNE_EQUIL_MIN_PCT 0.75f
-#define AUTOTUNE_RELAY_HYST 1.0
-// Fallback analysis minimum thresholds
-#define AUTOTUNE_FALLBACK_MIN_PERIOD 10.0f
-#define AUTOTUNE_FALLBACK_MIN_AMPLITUDE 1.0f
-// Oscillation consistency tolerance (max relative deviation from mean)
-#define AUTOTUNE_CONSISTENCY_TOLERANCE 0.10f
-// EMA noise filter alpha (0.0-1.0, lower = more smoothing)
-#define AUTOTUNE_EMA_ALPHA 0.3f
-// Temperature history buffer size (samples at ~1Hz)
-#define AUTOTUNE_TEMP_HISTORY_SIZE 120
-// Step response auto-tune configuration
-#define AUTOTUNE_STEP_BASELINE_TIME 60000
-#define AUTOTUNE_STEP_SETTLE_ROR 0.5f
-#define AUTOTUNE_STEP_SETTLE_TIME 30000
-#define AUTOTUNE_STEP_DATA_SIZE 300
+// -- Timing --
+#define AUTOTUNE_MIN_STEP_TIME 10000         // Min seconds per relay step (ms)
+#define AUTOTUNE_MAX_STEP_TIME 90000         // Max seconds per relay step (ms)
+#define AUTOTUNE_INITIAL_STEP_TIME 120000    // Heating phase timeout (ms)
+#define AUTOTUNE_MAX_DURATION 1800000        // Max total auto-tune duration (ms)
+#define AUTOTUNE_STABILIZATION_TIME 45000    // Equilibrium stabilization time (ms)
+#define AUTOTUNE_STABILITY_ROR_TIME 8000     // RoR must be low for this long (ms)
+// -- Thresholds --
+#define AUTOTUNE_TOTAL_STEPS 12              // Relay oscillation steps (>= 6 post-transient)
+#define AUTOTUNE_SETPOINT_TOLERANCE 2.5      // ±°C tolerance for "near setpoint"
+#define AUTOTUNE_STABILITY_ROR 2.0           // Max abs RoR for stable (°C/min)
+#define AUTOTUNE_EQUIL_MIN_PCT 0.75f         // Min fraction of target for equilibrium (0.0-1.0)
+#define AUTOTUNE_MIN_PEAKS 3                 // Min peaks for analysis
+#define AUTOTUNE_MIN_VALLEYS 3               // Min valleys for analysis
+#define AUTOTUNE_FALLBACK_MIN_PERIOD 10.0f   // Min period for valid fallback (seconds)
+#define AUTOTUNE_FALLBACK_MIN_AMPLITUDE 1.0f // Min amplitude for valid fallback (°C)
+#define AUTOTUNE_CONSISTENCY_TOLERANCE 0.10f // Max relative deviation for consistency (0.0-1.0)
+// -- Relay parameters (configurable via MQTT start command) --
+#define AUTOTUNE_OUTPUT_BIAS 50              // Default relay bias (%, 10-90)
+#define AUTOTUNE_OUTPUT_AMPLITUDE 25         // Default relay amplitude (%, 5-45)
+#define AUTOTUNE_RELAY_HYST 1.0              // Default relay hysteresis (°C, 0.1-5.0)
+// -- Filter --
+#define AUTOTUNE_EMA_ALPHA 0.3f              // EMA noise filter (0.0-1.0, lower = smoother)
+#define AUTOTUNE_TEMP_HISTORY_SIZE 120       // History buffer (samples at ~1Hz)
+// -- Step response mode --
+#define AUTOTUNE_STEP_BASELINE_TIME 60000    // Baseline measurement period (ms)
+#define AUTOTUNE_STEP_SETTLE_ROR 0.5f        // Max RoR for settled (°C/min)
+#define AUTOTUNE_STEP_SETTLE_TIME 30000      // Settle confirmation time (ms)
+#define AUTOTUNE_STEP_DATA_SIZE 300          // Data buffer (5 minutes at 1Hz)
 
 #endif
