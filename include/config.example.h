@@ -102,5 +102,9 @@ extern const char* password;
 #define AUTOTUNE_FASTTRACK_ROR_TIME 10000
 #define AUTOTUNE_EQUIL_MIN_TEMP 120.0
 #define AUTOTUNE_RELAY_HYST 1.0
+// EMA noise filter alpha (0.0-1.0, lower = more smoothing)
+#define AUTOTUNE_EMA_ALPHA 0.3f
+// Temperature history buffer size (samples at ~1Hz)
+#define AUTOTUNE_TEMP_HISTORY_SIZE 120
 
 #endif

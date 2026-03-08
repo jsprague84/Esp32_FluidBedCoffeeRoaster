@@ -33,6 +33,10 @@ static unsigned long autoTuneRorStableStartTime = 0;
 static unsigned long autoTuneFastTrackStartTime = 0;
 static bool autoTuneOutputHigh = false;
 
+// EMA noise filter for auto-tune temperature readings
+static float autoTuneFilteredTemp = 0.0f;
+static bool autoTuneFilterInitialized = false;
+
 // Auto-tune data storage
 static PeakValley autoTunePeaks[10];
 static PeakValley autoTuneValleys[10];
@@ -40,8 +44,8 @@ static int autoTunePeakCount = 0;
 static int autoTuneValleyCount = 0;
 
 // Auto-tune temperature history for oscillation detection
-static float autoTuneTempHistory[20];
-static unsigned long autoTuneTempTimeHistory[20];
+static float autoTuneTempHistory[AUTOTUNE_TEMP_HISTORY_SIZE];
+static unsigned long autoTuneTempTimeHistory[AUTOTUNE_TEMP_HISTORY_SIZE];
 static int autoTuneTempHistoryIndex = 0;
 static int autoTuneTempHistoryCount = 0;
 
@@ -267,6 +271,14 @@ void updateAutoTune() {
 
     unsigned long now = millis();
 
+    // Compute EMA-filtered temperature for relay decisions and peak tracking
+    if (!autoTuneFilterInitialized) {
+        autoTuneFilteredTemp = state.beanTemperature;
+        autoTuneFilterInitialized = true;
+    } else {
+        autoTuneFilteredTemp = AUTOTUNE_EMA_ALPHA * state.beanTemperature + (1.0f - AUTOTUNE_EMA_ALPHA) * autoTuneFilteredTemp;
+    }
+
     // Check for timeout
     if (now - autoTuneStartTime > AUTOTUNE_MAX_DURATION) {
         DEBUG_PRINTLN(F("Auto-tune timeout"));
@@ -276,16 +288,16 @@ void updateAutoTune() {
         return;
     }
 
-    // Add current temperature to history
-    if (autoTuneTempHistoryCount < 20) {
-        autoTuneTempHistory[autoTuneTempHistoryIndex] = state.beanTemperature;
+    // Add filtered temperature to history
+    if (autoTuneTempHistoryCount < AUTOTUNE_TEMP_HISTORY_SIZE) {
+        autoTuneTempHistory[autoTuneTempHistoryIndex] = autoTuneFilteredTemp;
         autoTuneTempTimeHistory[autoTuneTempHistoryIndex] = now;
-        autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % 20;
+        autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % AUTOTUNE_TEMP_HISTORY_SIZE;
         autoTuneTempHistoryCount++;
     } else {
-        autoTuneTempHistory[autoTuneTempHistoryIndex] = state.beanTemperature;
+        autoTuneTempHistory[autoTuneTempHistoryIndex] = autoTuneFilteredTemp;
         autoTuneTempTimeHistory[autoTuneTempHistoryIndex] = now;
-        autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % 20;
+        autoTuneTempHistoryIndex = (autoTuneTempHistoryIndex + 1) % AUTOTUNE_TEMP_HISTORY_SIZE;
     }
 
     if (autoTuneState == AUTOTUNE_HEATING) {
@@ -307,7 +319,8 @@ void updateAutoTune() {
         if (state.heaterOutput < 0) state.heaterOutput = 0;
         DEBUG_PRINTF("Auto-tune HEATING: err=%.1fC, out=%.0f\n", tempError, state.heaterOutput);
 
-        float absErr = abs(state.beanTemperature - autoTuneSetpoint);
+        // Use filtered temperature for setpoint comparisons
+        float absErr = fabs(autoTuneFilteredTemp - autoTuneSetpoint);
         if (absErr <= AUTOTUNE_SETPOINT_TOLERANCE) {
             if (!autoTuneReachedSetpoint) {
                 autoTuneReachedSetpoint = true;
@@ -391,7 +404,7 @@ void updateAutoTune() {
             autoTuneState = AUTOTUNE_RUNNING;
             autoTuneCurrentStep = 1;
             autoTuneStepStartTime = now;
-            if (state.beanTemperature <= autoTuneSetpoint) {
+            if (autoTuneFilteredTemp <= autoTuneSetpoint) {
                 autoTuneOutputHigh = true;
                 state.heaterOutput = (autoTuneOutputBias + autoTuneOutputAmplitude) * 255 / 100;
             } else {
@@ -406,7 +419,8 @@ void updateAutoTune() {
     else if (autoTuneState == AUTOTUNE_RUNNING) {
         unsigned long stepDuration = now - autoTuneStepStartTime;
         unsigned long stepTimeout = (autoTuneCurrentStep <= 2) ? AUTOTUNE_INITIAL_STEP_TIME : autoTuneStepTimeout;
-        float error = state.beanTemperature - autoTuneSetpoint;
+        // Use filtered temperature for relay decisions
+        float error = autoTuneFilteredTemp - autoTuneSetpoint;
 
         bool toggled = false;
         if (autoTuneOutputHigh) {
@@ -498,8 +512,8 @@ static bool calculateAutoTunePIDParameters() {
         const float ref = autoTuneSetpoint;
         int crossings[10]; int crossCount = 0;
         for (int i = 1; i < autoTuneTempHistoryCount && crossCount < 10; i++) {
-            int idxPrev = (autoTuneTempHistoryIndex - i - 1 + 20) % 20;
-            int idxCur = (autoTuneTempHistoryIndex - i + 20) % 20;
+            int idxPrev = (autoTuneTempHistoryIndex - i - 1 + AUTOTUNE_TEMP_HISTORY_SIZE) % AUTOTUNE_TEMP_HISTORY_SIZE;
+            int idxCur = (autoTuneTempHistoryIndex - i + AUTOTUNE_TEMP_HISTORY_SIZE) % AUTOTUNE_TEMP_HISTORY_SIZE;
             float prev = autoTuneTempHistory[idxPrev] - ref;
             float cur = autoTuneTempHistory[idxCur] - ref;
             if ((prev < 0 && cur >= 0) || (prev > 0 && cur <= 0)) {
@@ -516,7 +530,7 @@ static bool calculateAutoTunePIDParameters() {
         }
         float tmin = 1e9f, tmax = -1e9f;
         for (int i = 0; i < autoTuneTempHistoryCount; i++) {
-            int idx = (autoTuneTempHistoryIndex - i - 1 + 20) % 20;
+            int idx = (autoTuneTempHistoryIndex - i - 1 + AUTOTUNE_TEMP_HISTORY_SIZE) % AUTOTUNE_TEMP_HISTORY_SIZE;
             float v = autoTuneTempHistory[idx];
             if (v < tmin) tmin = v; if (v > tmax) tmax = v;
         }
@@ -558,4 +572,6 @@ static void resetAutoTuneData() {
     autoTuneRecommendedKp = 0;
     autoTuneRecommendedKi = 0;
     autoTuneRecommendedKd = 0;
+    autoTuneFilteredTemp = 0.0f;
+    autoTuneFilterInitialized = false;
 }
