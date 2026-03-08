@@ -86,6 +86,9 @@ static float autoTuneFOPDT_theta = 0.0f;
 static float autoTuneConsistencyPct = 0.0f;
 static float autoTuneAsymmetryRatio = 0.0f;
 static float autoTuneHysteresisCorrection = 0.0f;
+static float autoTuneOscPeriod = 0.0f;
+static float autoTuneOscAmplitude = 0.0f;
+static float autoTuneUltimateGain = 0.0f;
 
 // Status publishing interval
 static unsigned long lastAutoTuneStatusPublish = 0;
@@ -357,21 +360,74 @@ static void publishAutoTuneStatusMsg() {
 static void publishAutoTuneResultsMsg() {
     JsonDocument doc;
 
+    // Common fields for all modes
     doc["state"] = "complete";
+    doc["mode"] = autoTuneMode;
+    doc["tuning_method"] = autoTuneTuningMethod;
     doc["recommended_kp"] = autoTuneRecommendedKp;
     doc["recommended_ki"] = autoTuneRecommendedKi;
     doc["recommended_kd"] = autoTuneRecommendedKd;
-    doc["quality"] = autoTuneUsedFallback ? "fallback" : "estimated";
     doc["original_kp"] = autoTuneOriginalKp;
     doc["original_ki"] = autoTuneOriginalKi;
     doc["original_kd"] = autoTuneOriginalKd;
     doc["target_temperature"] = autoTuneTargetTemp;
-    doc["peak_count"] = autoTunePeakCount;
-    doc["valley_count"] = autoTuneValleyCount;
     doc["timestamp"] = millis();
     doc["duration"] = (millis() - autoTuneStartTime) / 1000;
 
-    static char atResultsBuf[512];
+    if (strcmp(autoTuneMode, "step_response") == 0) {
+        // Step response quality metrics
+        const char* quality = "poor";
+        if (autoTuneFOPDT_K > 0 && autoTuneFOPDT_tau > 5.0f && autoTuneFOPDT_theta > 0) {
+            quality = "good";
+        } else if (autoTuneFOPDT_K > 0 && autoTuneFOPDT_tau > 1.0f) {
+            quality = "acceptable";
+        }
+        doc["quality"] = quality;
+        doc["process_gain_K"] = autoTuneFOPDT_K;
+        doc["time_constant_tau"] = autoTuneFOPDT_tau;
+        doc["dead_time_theta"] = autoTuneFOPDT_theta;
+        doc["aggressiveness"] = autoTuneStepAggressiveness;
+        doc["simc_tau_c"] = autoTuneStepAggressiveness * autoTuneFOPDT_theta;
+        doc["baseline_temp"] = autoTuneStepBaselineTemp;
+        // Final temp: average of last 10 data points
+        float finalTemp = 0.0f;
+        int lastN = (autoTuneStepDataCount >= 10) ? 10 : autoTuneStepDataCount;
+        if (lastN > 0) {
+            for (int i = autoTuneStepDataCount - lastN; i < autoTuneStepDataCount; i++) {
+                finalTemp += autoTuneStepData[i].temperature;
+            }
+            finalTemp /= lastN;
+        }
+        doc["final_temp"] = finalTemp;
+        doc["data_points"] = autoTuneStepDataCount;
+    } else {
+        // Relay mode quality metrics
+        const char* quality = "poor";
+        if (autoTuneUsedFallback) {
+            quality = "fallback";
+        } else if (autoTuneConsistencyPct >= 0.90f) {
+            quality = "good";
+        } else if (autoTuneConsistencyPct >= 0.80f) {
+            quality = "acceptable";
+        }
+        doc["quality"] = quality;
+        doc["oscillation_period"] = autoTuneOscPeriod;
+        doc["oscillation_amplitude"] = autoTuneOscAmplitude;
+        doc["ultimate_gain"] = autoTuneUltimateGain;
+        if (autoTuneConsistencyPct > 0) doc["consistency_pct"] = autoTuneConsistencyPct;
+        else doc["consistency_pct"] = nullptr;
+        if (autoTuneAsymmetryRatio > 0) doc["asymmetry_ratio"] = autoTuneAsymmetryRatio;
+        else doc["asymmetry_ratio"] = nullptr;
+        if (autoTuneHysteresisCorrection > 0) doc["hysteresis_correction"] = autoTuneHysteresisCorrection;
+        else doc["hysteresis_correction"] = nullptr;
+        doc["peak_count"] = autoTunePeakCount;
+        doc["valley_count"] = autoTuneValleyCount;
+        doc["relay_bias"] = autoTuneOutputBias;
+        doc["relay_amplitude"] = autoTuneOutputAmplitude;
+        doc["relay_hysteresis"] = autoTuneRelayHyst;
+    }
+
+    static char atResultsBuf[768];
     size_t len = serializeJson(doc, atResultsBuf, sizeof(atResultsBuf));
 
     mqttPublishAutoTuneResults(atResultsBuf, len);
@@ -942,6 +998,11 @@ static bool calculateAutoTunePIDParameters() {
     if (autoTuneRecommendedKd > 100) autoTuneRecommendedKd = 100;
     if (autoTuneRecommendedKd < 0.5f) autoTuneRecommendedKd = 0.5f;
 
+    // Store metrics for quality reporting
+    autoTuneOscPeriod = avgPeriod;
+    autoTuneOscAmplitude = avgAmplitude;
+    autoTuneUltimateGain = Ku;
+
     DEBUG_PRINTF("Auto-tune results: Ku=%.2f, Period=%.1fs, Amplitude=%.2f°C\n", Ku, avgPeriod, avgAmplitude);
     DEBUG_PRINTF("Recommended PID: Kp=%.2f, Ki=%.4f, Kd=%.2f\n", autoTuneRecommendedKp, autoTuneRecommendedKi, autoTuneRecommendedKd);
     return true;
@@ -966,6 +1027,9 @@ static void resetAutoTuneData() {
     autoTuneConsistencyPct = 0.0f;
     autoTuneAsymmetryRatio = 0.0f;
     autoTuneHysteresisCorrection = 0.0f;
+    autoTuneOscPeriod = 0.0f;
+    autoTuneOscAmplitude = 0.0f;
+    autoTuneUltimateGain = 0.0f;
     autoTuneTuningMethod = "tyreus_luyben";
     autoTuneOutputBias = AUTOTUNE_OUTPUT_BIAS;
     autoTuneOutputAmplitude = AUTOTUNE_OUTPUT_AMPLITUDE;
