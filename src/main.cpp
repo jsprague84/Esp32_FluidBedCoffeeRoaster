@@ -32,6 +32,7 @@ unsigned long lastMqttPublish = 0;
 // Function prototypes
 void initializePins();
 void initStateDefaults();
+void setupNTP();
 void checkWiFiConnection();
 void updateSystemStatus();
 SystemStatus checkSensors();
@@ -79,6 +80,7 @@ void setup() {
         Serial.println(F("\nWiFi connected!"));
         Serial.printf_P(PSTR("IP Address: %s\n"), WiFi.localIP().toString().c_str());
 
+        setupNTP();
         initMQTT();
     } else {
         Serial.println(F("\nWiFi connection failed!"));
@@ -175,6 +177,25 @@ void loop() {
                      static_cast<int>(state.heaterOutput), state.fanPWM, state.heaterEnabled,
                      mqttIsConnected() ? "OK" : "DISCONNECTED");
     }
+}
+
+void setupNTP() {
+    configTime(NTP_GMT_OFFSET, NTP_DAYLIGHT_OFFSET, NTP_SERVER_1, NTP_SERVER_2);
+    DEBUG_PRINTLN(F("NTP: Waiting for time sync..."));
+    for (int i = 0; i < 10; i++) {
+        time_t now = time(nullptr);
+        if (now > 1000000000) {
+            DEBUG_PRINTF("NTP: Time synced (epoch: %ld)\n", (long)now);
+            return;
+        }
+        delay(1000);
+    }
+    DEBUG_PRINTLN(F("NTP: Sync timeout - continuing without NTP"));
+}
+
+time_t getEpochTime() {
+    time_t now = time(nullptr);
+    return (now > 1000000000) ? now : 0;
 }
 
 void initializePins() {

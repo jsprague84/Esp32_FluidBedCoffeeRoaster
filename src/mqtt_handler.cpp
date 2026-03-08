@@ -10,6 +10,10 @@
 #include "safety.h"
 #include "temperature.h"
 #include "autotune.h"
+#include "esp_heap_caps.h"
+
+// Defined in main.cpp
+extern time_t getEpochTime();
 
 // MQTT client instance
 static ESP32MQTTClient mqttClient;
@@ -143,7 +147,9 @@ void publishTelemetry() {
 
     JsonDocument doc;
 
-    doc["timestamp"] = millis();
+    doc["timestamp"] = (uint64_t)getEpochTime();
+    doc["uptimeMs"] = (uint64_t)millis();
+    doc["uptime"] = millis() / 1000;
     doc["beanTemp"] = round(state.beanTemperature * 10) / 10.0;
     doc["envTemp"] = round(state.envTemperature * 10) / 10.0;
     doc["rateOfRise"] = round(getRateOfRise() * 100) / 100.0;
@@ -152,11 +158,11 @@ void publishTelemetry() {
     doc["setpoint"] = round(state.beanSetpoint * 10) / 10.0;
     doc["controlMode"] = state.controlMode;
     doc["heaterEnable"] = state.heaterEnabled ? 1 : 0;
-    doc["uptime"] = millis() / 1000;
     doc["Kp"] = state.Kp;
     doc["Ki"] = state.Ki;
     doc["Kd"] = state.Kd;
     doc["freeHeap"] = ESP.getFreeHeap();
+    doc["largestFreeBlock"] = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     doc["rssi"] = WiFi.RSSI();
     doc["systemStatus"] = state.systemStatus;
 
@@ -182,7 +188,7 @@ void publishStatus(const char* status) {
     doc["rssi"] = WiFi.RSSI();
     doc["version"] = FIRMWARE_VERSION;
     doc["freeHeap"] = ESP.getFreeHeap();
-    doc["timestamp"] = millis();
+    doc["timestamp"] = (uint64_t)getEpochTime();
 
     static char statusBuf[256];
     size_t len = serializeJson(doc, statusBuf, sizeof(statusBuf));
