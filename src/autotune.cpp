@@ -32,6 +32,9 @@ static float autoTuneStepTimeout = AUTOTUNE_MAX_STEP_TIME;
 static unsigned long autoTuneRorStableStartTime = 0;
 static bool autoTuneOutputHigh = false;
 
+// Tuning method selection
+static const char* autoTuneTuningMethod = "tyreus_luyben";
+
 // EMA noise filter for auto-tune temperature readings
 static float autoTuneFilteredTemp = 0.0f;
 static bool autoTuneFilterInitialized = false;
@@ -122,7 +125,21 @@ void handleAutoTuneStart(const char* payload, size_t len) {
         return;
     }
 
-    DEBUG_PRINTF("Starting auto-tune for target temperature: %.1f°C\n", targetTemp);
+    // Parse optional tuning method (assign to static string literals for safety)
+    const char* method = doc["tuning_method"] | "tyreus_luyben";
+    if (strcmp(method, "zn_classic") == 0) {
+        autoTuneTuningMethod = "zn_classic";
+    } else if (strcmp(method, "zn_some_overshoot") == 0) {
+        autoTuneTuningMethod = "zn_some_overshoot";
+    } else if (strcmp(method, "zn_no_overshoot") == 0) {
+        autoTuneTuningMethod = "zn_no_overshoot";
+    } else if (strcmp(method, "tyreus_luyben") == 0) {
+        autoTuneTuningMethod = "tyreus_luyben";
+    } else {
+        autoTuneTuningMethod = "tyreus_luyben";
+        DEBUG_PRINTF("Auto-tune: unrecognized tuning_method '%s', defaulting to tyreus_luyben\n", method);
+    }
+    DEBUG_PRINTF("Starting auto-tune: target=%.1f°C, tuning_method=%s\n", targetTemp, autoTuneTuningMethod);
 
     autoTuneTargetTemp = targetTemp;
     autoTuneSetpoint = targetTemp;
@@ -629,10 +646,26 @@ static bool calculateAutoTunePIDParameters() {
                  rawKu, (autoTuneAsymmetryRatio > 0) ? Ku / (rawKu * autoTuneHysteresisCorrection) : 1.0f,
                  autoTuneHysteresisCorrection, Ku);
 
-    // Ziegler-Nichols PID rules (will be replaced by tuning method selection in US-006)
-    autoTuneRecommendedKp = 0.6f * Ku;
-    autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
-    autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 8.0f;
+    // PID tuning method dispatch
+    DEBUG_PRINTF("Auto-tune using tuning method: %s\n", autoTuneTuningMethod);
+    if (strcmp(autoTuneTuningMethod, "zn_classic") == 0) {
+        autoTuneRecommendedKp = 0.6f * Ku;
+        autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
+        autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 8.0f;
+    } else if (strcmp(autoTuneTuningMethod, "zn_some_overshoot") == 0) {
+        autoTuneRecommendedKp = 0.33f * Ku;
+        autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
+        autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 3.0f;
+    } else if (strcmp(autoTuneTuningMethod, "zn_no_overshoot") == 0) {
+        autoTuneRecommendedKp = 0.2f * Ku;
+        autoTuneRecommendedKi = (2.0f * autoTuneRecommendedKp) / avgPeriod;
+        autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 3.0f;
+    } else {
+        // Default: Tyreus-Luyben (conservative, ~5% overshoot)
+        autoTuneRecommendedKp = Ku / 3.2f;
+        autoTuneRecommendedKi = autoTuneRecommendedKp / (2.2f * avgPeriod);
+        autoTuneRecommendedKd = (autoTuneRecommendedKp * avgPeriod) / 6.3f;
+    }
 
     if (autoTuneRecommendedKp > 50) autoTuneRecommendedKp = 50;
     if (autoTuneRecommendedKp < 0.5f) autoTuneRecommendedKp = 0.5f;
@@ -665,4 +698,5 @@ static void resetAutoTuneData() {
     autoTuneConsistencyPct = 0.0f;
     autoTuneAsymmetryRatio = 0.0f;
     autoTuneHysteresisCorrection = 0.0f;
+    autoTuneTuningMethod = "tyreus_luyben";
 }
